@@ -253,6 +253,7 @@
             <option value="name">按名称</option>
           </select>
           <button id="rebalance-nodes" class="button" type="button" title="按启用节点把 CPA 账号 proxy_url 重新均分">重平衡账号</button>
+          <button id="discover-nodes" class="button" type="button">从 Grok 凭证发现节点</button>
           <button id="bulk-add-node" class="button" type="button">批量添加</button>
           <button id="add-node" class="button primary" type="button">添加节点</button>
         </div>
@@ -337,6 +338,22 @@
         </div>
         <div class="modal-actions"><button class="button" type="button" data-close="node-modal">取消</button><button id="save-node" class="button primary" type="submit">保存</button></div>
       </form>
+    </section>
+  </div>
+
+  <div id="discover-modal" class="modal-layer" hidden>
+    <section class="modal wide" role="dialog" aria-modal="true" aria-labelledby="discover-modal-title">
+      <div class="modal-head"><div><h3 id="discover-modal-title">从 Grok 凭证发现节点</h3><p>只读扫描 xAI 账号的 proxy_url，不改凭证、不自动隔离</p></div><button class="button icon ghost" type="button" data-close="discover-modal" aria-label="关闭">×</button></div>
+      <div class="modal-body">
+        <p id="discover-status" class="help">点击开始扫描现有 Grok 凭证。</p>
+        <div id="discover-summary" class="help"></div>
+        <div id="discover-list" class="account-list"></div>
+      </div>
+      <div class="modal-actions">
+        <button class="button" type="button" data-close="discover-modal">取消</button>
+        <button id="discover-start" class="button" type="button">开始扫描</button>
+        <button id="discover-commit" class="button primary" type="button" hidden>导入新节点</button>
+      </div>
     </section>
   </div>
 
@@ -451,6 +468,9 @@
       nodeFilterEnabled: '',
       nodeFilterState: '',
       nodeSort: localStorage.getItem('egress-guard-node-sort') || 'status',
+      nodePageMeta: null,
+      loadSeq: 0,
+      searchTimer: 0,
       editing: null,
       editingProfile: null,
       confirm: null,
@@ -534,15 +554,32 @@
       state.loading = true;
       busy($('refresh-button'), true);
       try {
+        const seq = ++state.loadSeq;
+        const params = new URLSearchParams({
+          page: String(state.nodePage || 1),
+          pageSize: String(state.nodePageSize || 50),
+          sort: state.nodeSort || 'status'
+        });
+        if (state.search.trim()) params.set('q', state.search.trim());
+        if (state.nodeFilterEnabled) params.set('enabled', state.nodeFilterEnabled);
+        if (state.nodeFilterState) params.set('state', state.nodeFilterState);
         const [status, list] = await Promise.all([
-          api('/quality-guard'),
-          api('/nodes')
+          api('/quality-guard?view=summary'),
+          api('/nodes?' + params.toString())
         ]);
+        if (seq !== state.loadSeq) return;
         state.status = status;
-        const items = list.items || list.data?.items || [];
+        const data = list.data || list;
+        const items = data.items || list.items || [];
         state.nodes = Array.isArray(items) ? items : [];
-        const known = new Set(state.nodes.map((node) => node.id));
-        state.selected = new Set([...state.selected].filter((id) => known.has(id)));
+        const total = Number(data.total ?? list.total ?? state.nodes.length);
+        const page = Number(data.page || state.nodePage || 1);
+        const pageSize = Number(data.pageSize || state.nodePageSize || 50);
+        const totalPages = Number(data.totalPages || Math.max(1, Math.ceil(total / pageSize) || 1));
+        const all = Number(data.summary?.totalNodes ?? status.summary?.totalNodes ?? total);
+        state.nodePage = page;
+        state.nodePageSize = pageSize;
+        state.nodePageMeta = { total, page, pageSize, totalPages, matched: total, all };
         render();
         setService(true, status?.engine === 'cpa-native' ? 'CPA 原生守护' : '已连接');
       } catch (error) {
@@ -585,22 +622,41 @@
     }
     function renderMetrics() {
       const status = state.status || {};
-      const guardNodes = status.nodes || {};
+      const summary = status.summary || state.nodePageMeta || {};
       const fresh = status.available && status.updatedAt && (Date.now() / 1000 - status.updatedAt < 30);
-      const enabled = state.nodes.filter((node) => node.enabled).length;
-      const quarantined = state.nodes.filter((node) => guardNodes[node.id]?.disabled_by_guard).length;
+      const enabled = Number(summary.enabledNodes ?? state.nodes.filter((node) => node.enabled).length);
+      const total = Number(summary.totalNodes ?? state.nodePageMeta?.all ?? state.nodes.length);
+      const quarantined = Number(summary.quarantinedNodes ?? 0);
       $('metric-service').textContent = fresh ? '运行中' : status.available ? '状态滞后' : '不可用';
       $('metric-service').className = 'metric-value ' + (fresh ? 'tone-good' : 'tone-bad');
       $('metric-updated').textContent = status.updatedAt ? '更新于 ' + relative(status.updatedAt) : '没有状态数据';
       $('metric-mode').textContent = modeName(status.config?.mode);
       $('metric-model').textContent = status.config?.model || '-';
-      $('metric-enabled').textContent = enabled + ' / ' + state.nodes.length;
+      $('metric-enabled').textContent = enabled + ' / ' + total;
       $('metric-total').textContent = '已启用 / 全部 CPA 出口节点';
       $('metric-quarantined').textContent = String(quarantined);
       $('metric-quarantined').className = 'metric-value ' + (quarantined ? 'tone-bad' : 'tone-good');
       $('metric-next').textContent = quarantined ? '等待真实模型复测' : '当前无隔离节点';
     }
-    function nodeGuard(node) { return state.status?.nodes?.[node.id] || {}; }
+    function nodeGuard(node) {
+      return {
+        disabled_by_guard: node.disabled_by_guard,
+        quarantined_until: node.quarantined_until,
+        error_strikes: node.error_strikes,
+        soft_strikes: node.soft_strikes,
+        thinking_strikes: node.thinking_strikes,
+        last_classification: node.last_classification,
+        last_output_tps: node.last_output_tps,
+        last_first_token_ms: node.last_first_token_ms,
+        last_duration_ms: node.last_duration_ms,
+        last_output_tokens: node.last_output_tokens,
+        last_reason: node.last_reason,
+        last_source: node.last_source,
+        last_observed_at: node.last_observed_at,
+        last_probe_at: node.last_probe_at,
+        ...(state.status?.nodes?.[node.id] || {})
+      };
+    }
     function nodeRank(node) {
       const guard = nodeGuard(node);
       if (!node.enabled) return 2; // 停用沉底
@@ -636,6 +692,10 @@
       });
     }
     function pagedNodes() {
+      if (state.nodePageMeta) {
+        const meta = state.nodePageMeta;
+        return { nodes: state.nodes, total: meta.matched, page: meta.page, pageSize: meta.pageSize, totalPages: meta.totalPages, matched: meta.matched, all: meta.all };
+      }
       const nodes = filteredNodes();
       const pageSize = PAGE_SIZES.includes(Number(state.nodePageSize)) ? Number(state.nodePageSize) : 50;
       const total = nodes.length;
@@ -732,7 +792,7 @@
         if (size && String(size.value) !== String(page.pageSize)) size.value = String(page.pageSize);
       }
       if (!nodes.length) {
-        const empty = (state.search || state.nodeFilterEnabled || state.nodeFilterState) ? '没有匹配的节点' : '暂无出口节点';
+        const empty = (state.search || state.nodeFilterEnabled || state.nodeFilterState) ? '没有匹配的节点' : '暂无出口节点。可从 Grok 凭证发现，或手动添加。';
         $('nodes-body').innerHTML = '<tr><td colspan="9" class="empty">' + empty + '</td></tr>';
         $('node-cards').innerHTML = '<div class="empty">' + empty + '</div>';
         return;
@@ -991,27 +1051,92 @@
       document.documentElement.dataset.theme = dark ? 'light' : 'dark';
       localStorage.setItem('grok2api-egress-theme', dark ? 'light' : 'dark');
     });
-    $('node-search').addEventListener('input', (event) => { state.search = event.target.value; state.nodePage = 1; renderNodes(); });
-    $('node-filter-enabled')?.addEventListener('change', (event) => { state.nodeFilterEnabled = event.target.value; state.nodePage = 1; renderNodes(); });
-    $('node-filter-state')?.addEventListener('change', (event) => { state.nodeFilterState = event.target.value; state.nodePage = 1; renderNodes(); });
+    $('node-search').addEventListener('input', (event) => {
+      state.search = event.target.value;
+      state.nodePage = 1;
+      window.clearTimeout(state.searchTimer);
+      state.searchTimer = window.setTimeout(() => load(true), 200);
+    });
+    $('node-filter-enabled')?.addEventListener('change', (event) => { state.nodeFilterEnabled = event.target.value; state.nodePage = 1; load(true); });
+    $('node-filter-state')?.addEventListener('change', (event) => { state.nodeFilterState = event.target.value; state.nodePage = 1; load(true); });
     $('node-sort')?.addEventListener('change', (event) => {
       state.nodeSort = event.target.value || 'status';
       localStorage.setItem('egress-guard-node-sort', state.nodeSort);
-      renderNodes();
+      state.nodePage = 1;
+      load(true);
     });
-    $('nodes-page-prev')?.addEventListener('click', () => { state.nodePage = Math.max(1, Number(state.nodePage || 1) - 1); renderNodes(); });
-    $('nodes-page-next')?.addEventListener('click', () => { state.nodePage = Number(state.nodePage || 1) + 1; renderNodes(); });
-    $('nodes-page-first')?.addEventListener('click', () => { state.nodePage = 1; renderNodes(); });
-    $('nodes-page-last')?.addEventListener('click', () => { state.nodePage = 1e9; renderNodes(); });
+    $('nodes-page-prev')?.addEventListener('click', () => { state.nodePage = Math.max(1, Number(state.nodePage || 1) - 1); load(true); });
+    $('nodes-page-next')?.addEventListener('click', () => { state.nodePage = Number(state.nodePage || 1) + 1; load(true); });
+    $('nodes-page-first')?.addEventListener('click', () => { state.nodePage = 1; load(true); });
+    $('nodes-page-last')?.addEventListener('click', () => { state.nodePage = 1e9; load(true); });
     $('nodes-page-size')?.addEventListener('change', (event) => {
       const next = Number(event.target.value);
       state.nodePageSize = PAGE_SIZES.includes(next) ? next : 50;
       localStorage.setItem('egress-guard-page-size', String(state.nodePageSize));
       state.nodePage = 1;
-      renderNodes();
+      load(true);
     });
     $('add-node').addEventListener('click', () => openNode());
     $('bulk-add-node').addEventListener('click', () => openModal('bulk-node-modal'));
+    $('discover-nodes')?.addEventListener('click', () => {
+      $('discover-status').textContent = '点击开始扫描现有 Grok 凭证。';
+      $('discover-summary').textContent = '';
+      $('discover-list').innerHTML = '';
+      $('discover-commit').hidden = true;
+      openModal('discover-modal');
+    });
+    $('discover-start')?.addEventListener('click', async (event) => {
+      const button = event.currentTarget;
+      busy(button, true);
+      $('discover-commit').hidden = true;
+      $('discover-status').textContent = '正在扫描凭证…';
+      try {
+        const started = await api('/nodes/discovery', {method:'POST'});
+        const op0 = started.data || started;
+        let op = op0;
+        for (let i = 0; i < 60; i++) {
+          if (op.status !== 'running') break;
+          await new Promise((resolve) => window.setTimeout(resolve, 400));
+          const polled = await api('/operations/' + encodeURIComponent(op.id));
+          op = polled.data || polled;
+        }
+        const summary = op.summary || {};
+        $('discover-status').textContent = op.status === 'succeeded'
+          ? (summary.complete ? '扫描完成' : '扫描完成，但部分凭证读取失败')
+          : ('扫描未完成：' + (op.error || op.status));
+        $('discover-summary').textContent = '凭证 ' + (summary.authTotal || 0) + ' · xAI ' + (summary.xaiAuths || 0) + ' · 唯一代理 ' + (summary.uniqueProxies || 0) + ' · 可新建 ' + (summary.newNodes || 0) + ' · 已存在 ' + (summary.alreadyExists || 0) + ' · 冲突 ' + (summary.conflicts || 0) + ' · 失败 ' + (summary.failed || 0);
+        const list = await api('/nodes/discovery/' + encodeURIComponent(op.id) + '/candidates?page=1&pageSize=50');
+        const items = list.items || list.data?.items || [];
+        if (!items.length) {
+          $('discover-list').innerHTML = '<div class="empty">没有可导入的代理节点</div>';
+        } else {
+          $('discover-list').innerHTML = items.map((item) => '<div class="account-row"><div><strong>' + esc(item.scheme || '') + '://' + esc(item.hostPreview || '') + '</strong><div class="subtext">' + esc(item.status) + ' · 凭证 ' + esc(item.authCount) + '</div></div><div>' + (item.status === 'new' ? '<span class="badge good">新建</span>' : item.status === 'already_exists' ? '<span class="badge muted">已存在</span>' : '<span class="badge warn">' + esc(item.status) + '</span>') + '</div></div>').join('');
+        }
+        $('discover-commit').hidden = !(summary.newNodes > 0 && op.status === 'succeeded');
+        $('discover-commit').dataset.opId = op.id;
+        $('discover-commit').dataset.revision = String(summary.configRevision || '');
+      } catch (error) {
+        $('discover-status').textContent = error.message;
+        toast(error.message, 'error');
+      } finally { busy(button, false); }
+    });
+    $('discover-commit')?.addEventListener('click', async (event) => {
+      const button = event.currentTarget;
+      const opId = button.dataset.opId;
+      if (!opId) return;
+      busy(button, true);
+      try {
+        const result = await api('/nodes/discovery/' + encodeURIComponent(opId) + '/commit', {
+          method:'POST',
+          body:{ selection: {mode:'all_confirmed'}, expectedConfigRevision: Number(button.dataset.revision || 0) }
+        });
+        const data = result.data || result;
+        toast('已导入 ' + (data.created || 0) + ' 个观察模式节点');
+        closeModal('discover-modal');
+        await load(true);
+      } catch (error) { toast(error.message, 'error'); }
+      finally { busy(button, false); }
+    });
     $('bulk-node-input').addEventListener('input', (event) => {
       try {
         const count = parseBulkNodes(event.target.value).length;

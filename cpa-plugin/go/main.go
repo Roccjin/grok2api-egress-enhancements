@@ -19,7 +19,7 @@ import (
 
 const (
 	pluginName          = "grok2api-egress"
-	pluginVersion       = "1.2.0"
+	pluginVersion       = "1.3.0"
 	resourcePath        = "/status"
 	managementAPIPath   = "/v0/management/grok2api-egress/api"
 	resourceContentType = "text/html; charset=utf-8"
@@ -263,7 +263,88 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 		if method != http.MethodGet {
 			return managementJSON(http.StatusMethodNotAllowed, errMsg("methodNotAllowed", "method not allowed"))
 		}
+		if strings.EqualFold(query.Get("view"), "summary") {
+			return managementJSON(http.StatusOK, buildStatusSummary())
+		}
 		return managementJSON(http.StatusOK, buildStatus())
+
+	case path == "/nodes/discovery":
+		if method != http.MethodPost {
+			return managementJSON(http.StatusMethodNotAllowed, errMsg("methodNotAllowed", "method not allowed"))
+		}
+		op, err := startNodeDiscovery()
+		if err != nil {
+			return managementJSON(http.StatusBadRequest, errMsg("discoveryFailed", err.Error()))
+		}
+		return managementJSON(http.StatusOK, map[string]any{"data": publicDiscoveryOp(op)})
+
+	case len(parts) == 2 && parts[0] == "operations":
+		op := getDiscoveryOp(parts[1])
+		if op == nil {
+			return managementJSON(http.StatusNotFound, errMsg("notFound", "operation not found"))
+		}
+		if method == http.MethodGet {
+			return managementJSON(http.StatusOK, map[string]any{"data": publicDiscoveryOp(op)})
+		}
+		return managementJSON(http.StatusMethodNotAllowed, errMsg("methodNotAllowed", "method not allowed"))
+
+	case len(parts) == 3 && parts[0] == "operations" && parts[2] == "cancel":
+		if method != http.MethodPost {
+			return managementJSON(http.StatusMethodNotAllowed, errMsg("methodNotAllowed", "method not allowed"))
+		}
+		op := getDiscoveryOp(parts[1])
+		if op == nil {
+			return managementJSON(http.StatusNotFound, errMsg("notFound", "operation not found"))
+		}
+		op.cancel.Store(true)
+		if op.Status == "running" {
+			op.Status = "cancelled"
+		}
+		return managementJSON(http.StatusOK, map[string]any{"data": publicDiscoveryOp(op)})
+
+	case len(parts) == 4 && parts[0] == "nodes" && parts[1] == "discovery" && parts[3] == "candidates":
+		if method != http.MethodGet {
+			return managementJSON(http.StatusMethodNotAllowed, errMsg("methodNotAllowed", "method not allowed"))
+		}
+		op := getDiscoveryOp(parts[2])
+		if op == nil {
+			return managementJSON(http.StatusNotFound, errMsg("notFound", "discovery not found"))
+		}
+		page, err := parsePositiveInt(query.Get("page"), 1)
+		if err != nil {
+			return managementJSON(http.StatusBadRequest, errMsg("invalidPage", err.Error()))
+		}
+		pageSize, err := parsePositiveInt(query.Get("pageSize"), 50)
+		if err != nil || pageSize > 100 {
+			return managementJSON(http.StatusBadRequest, errMsg("invalidPageSize", "pageSize must be 1-100"))
+		}
+		items, total, outPage, totalPages := pageDiscoveryCandidates(op, page, pageSize)
+		return managementJSON(http.StatusOK, map[string]any{"data": map[string]any{"items": items, "total": total, "page": outPage, "pageSize": pageSize, "totalPages": totalPages}, "items": items, "total": total})
+
+	case len(parts) == 4 && parts[0] == "nodes" && parts[1] == "discovery" && parts[3] == "commit":
+		if method != http.MethodPost {
+			return managementJSON(http.StatusMethodNotAllowed, errMsg("methodNotAllowed", "method not allowed"))
+		}
+		op := getDiscoveryOp(parts[2])
+		var raw map[string]any
+		_ = json.Unmarshal(body, &raw)
+		selection := ""
+		if sel, ok := raw["selection"].(map[string]any); ok {
+			selection, _ = sel["mode"].(string)
+		}
+		if selection == "" {
+			selection, _ = raw["selection"].(string)
+		}
+		expected := int64(0)
+		switch v := raw["expectedConfigRevision"].(type) {
+		case float64:
+			expected = int64(v)
+		}
+		result, err := commitDiscovery(op, selection, expected)
+		if err != nil {
+			return managementJSON(http.StatusConflict, errMsg("commitFailed", err.Error()))
+		}
+		return managementJSON(http.StatusOK, map[string]any{"data": result})
 
 	case path == "/storage/restore":
 		if method != http.MethodPost {
@@ -419,6 +500,28 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 	case path == "/nodes":
 		if method == http.MethodGet {
 			refreshAssignedCounts(store)
+			if query.Get("page") != "" || query.Get("pageSize") != "" {
+				parsed, err := parseNodeListQuery(query)
+				if err != nil {
+					return managementJSON(http.StatusBadRequest, errMsg("invalidQuery", err.Error()))
+				}
+				page := store.listNodesPage(parsed)
+				out := make([]map[string]any, 0, len(page.Items))
+				for _, n := range page.Items {
+					out = append(out, publicNode(n))
+				}
+				payload := map[string]any{
+					"items":          out,
+					"total":          page.Total,
+					"page":           page.Page,
+					"pageSize":       page.PageSize,
+					"totalPages":     page.TotalPages,
+					"configRevision": store.snapshot().ConfigRevision,
+					"observedAt":     time.Now().UTC().Format(time.RFC3339),
+					"summary":        page.Summary,
+				}
+				return managementJSON(http.StatusOK, map[string]any{"data": payload, "items": out, "total": page.Total})
+			}
 			items := store.listNodes()
 			out := make([]map[string]any, 0, len(items))
 			for _, n := range items {
@@ -731,6 +834,18 @@ func buildStatus() map[string]any {
 		"lifecycle":    life,
 		"hint":         "纯 CPA 出口守护：节点代理写在账号 proxy_url，被动 Token/s 审计 + 主动质量探测，不依赖 Grok2API。",
 	}
+}
+
+func buildStatusSummary() map[string]any {
+	full := buildStatus()
+	delete(full, "nodes")
+	delete(full, "authStats")
+	if store != nil {
+		page := store.listNodesPage(nodeListQuery{Page: 1, PageSize: 1})
+		full["summary"] = page.Summary
+		full["configRevision"] = store.snapshot().ConfigRevision
+	}
+	return full
 }
 
 func profileIDFrom(query url.Values, body json.RawMessage) string {

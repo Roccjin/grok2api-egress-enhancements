@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -164,18 +165,19 @@ type authDegradeRecord struct {
 }
 
 type guardState struct {
-	Version        int                           `json:"version"`
-	SchemaVersion  int                           `json:"schema_version,omitempty"`
-	ConfigRevision int64                         `json:"config_revision,omitempty"`
-	LastPersistAt  float64                       `json:"last_persist_at,omitempty"`
-	Policy         policyConfig                  `json:"policy"`
-	Nodes          map[string]*nodeRecord        `json:"nodes"`
-	Profiles       map[string]*ProbeProfile      `json:"profiles"`
-	Events         []guardEvent                  `json:"events"`
-	Stats          statistics                    `json:"statistics"`
-	AuthStats      map[string]*authDegradeRecord `json:"auth_stats"`
-	NextID         int                           `json:"next_id"`
-	UpdatedAt      float64                       `json:"updated_at"`
+	Version                int                           `json:"version"`
+	SchemaVersion          int                           `json:"schema_version,omitempty"`
+	ConfigRevision         int64                         `json:"config_revision,omitempty"`
+	LastPersistAt          float64                       `json:"last_persist_at,omitempty"`
+	Policy                 policyConfig                  `json:"policy"`
+	Nodes                  map[string]*nodeRecord        `json:"nodes"`
+	Profiles               map[string]*ProbeProfile      `json:"profiles"`
+	Events                 []guardEvent                  `json:"events"`
+	Stats                  statistics                    `json:"statistics"`
+	AuthStats              map[string]*authDegradeRecord `json:"auth_stats"`
+	NextID                 int                           `json:"next_id"`
+	UpdatedAt              float64                       `json:"updated_at"`
+	IgnoredProxyIdentities []string                      `json:"ignored_proxy_identities,omitempty"`
 }
 
 type stateStore struct {
@@ -903,9 +905,319 @@ func (s *stateStore) listNodes() []*nodeRecord {
 		out = append(out, &cp)
 	}
 	sort.Slice(out, func(i, j int) bool {
-		return out[i].ID < out[j].ID
+		return compareNodeID(out[i].ID, out[j].ID) < 0
 	})
 	return out
+}
+
+type nodeListQuery struct {
+	Page     int
+	PageSize int
+	Q        string
+	Enabled  string
+	State    string
+	Sort     string
+	Order    string
+}
+
+func parseNodeListQuery(query url.Values) (nodeListQuery, error) {
+	out := nodeListQuery{Page: 1, PageSize: 50, Sort: "status", Order: "asc"}
+	if query == nil {
+		return out, nil
+	}
+	page, err := parsePositiveInt(query.Get("page"), 1)
+	if err != nil {
+		return out, fmt.Errorf("page %w", err)
+	}
+	out.Page = page
+	if raw := strings.TrimSpace(query.Get("pageSize")); raw != "" {
+		n, convErr := strconv.Atoi(raw)
+		if convErr != nil || n < 1 || n > 100 {
+			return out, fmt.Errorf("pageSize must be an integer from 1 to 100")
+		}
+		out.PageSize = n
+	}
+	out.Q = strings.TrimSpace(query.Get("q"))
+	out.Enabled = strings.TrimSpace(query.Get("enabled"))
+	switch out.Enabled {
+	case "", "true", "false":
+	default:
+		return out, fmt.Errorf("enabled must be true or false")
+	}
+	out.State = strings.TrimSpace(query.Get("state"))
+	switch out.State {
+	case "", "quarantined", "disabled", "healthy":
+	default:
+		return out, fmt.Errorf("state is invalid")
+	}
+	out.Sort = strings.TrimSpace(query.Get("sort"))
+	if out.Sort == "" {
+		out.Sort = "status"
+	}
+	switch out.Sort {
+	case "status", "id", "name":
+	default:
+		return out, fmt.Errorf("sort is invalid")
+	}
+	out.Order = strings.ToLower(strings.TrimSpace(query.Get("order")))
+	if out.Order == "" {
+		out.Order = "asc"
+	}
+	switch out.Order {
+	case "asc", "desc":
+	default:
+		return out, fmt.Errorf("order must be asc or desc")
+	}
+	return out, nil
+}
+
+type nodeListPage struct {
+	Items      []*nodeRecord
+	Total      int
+	Page       int
+	PageSize   int
+	TotalPages int
+	Summary    nodeListSummary
+}
+
+type nodeListSummary struct {
+	TotalNodes       int `json:"totalNodes"`
+	EnabledNodes     int `json:"enabledNodes"`
+	QuarantinedNodes int `json:"quarantinedNodes"`
+}
+
+func compareNodeID(a, b string) int {
+	na, errA := strconv.Atoi(a)
+	nb, errB := strconv.Atoi(b)
+	if errA == nil && errB == nil && strconv.Itoa(na) == a && strconv.Itoa(nb) == b && na != nb {
+		return na - nb
+	}
+	return strings.Compare(a, b)
+}
+
+func (s *stateStore) nodeSummaryLocked() nodeListSummary {
+	sum := nodeListSummary{TotalNodes: len(s.data.Nodes)}
+	for _, n := range s.data.Nodes {
+		if n.Enabled {
+			sum.EnabledNodes++
+		}
+		if n.DisabledByGuard {
+			sum.QuarantinedNodes++
+		}
+	}
+	return sum
+}
+
+func (s *stateStore) listNodesPage(q nodeListQuery) nodeListPage {
+	all := s.listNodes()
+	s.mu.Lock()
+	summary := s.nodeSummaryLocked()
+	s.mu.Unlock()
+	query := strings.ToLower(strings.TrimSpace(q.Q))
+	filtered := make([]*nodeRecord, 0, len(all))
+	for _, n := range all {
+		if query != "" {
+			blob := strings.ToLower(strings.Join([]string{n.ID, n.Name, n.ExitIP}, " "))
+			if !strings.Contains(blob, query) {
+				continue
+			}
+		}
+		switch q.Enabled {
+		case "true":
+			if !n.Enabled {
+				continue
+			}
+		case "false":
+			if n.Enabled {
+				continue
+			}
+		}
+		switch q.State {
+		case "quarantined":
+			if !n.DisabledByGuard {
+				continue
+			}
+		case "disabled":
+			if n.Enabled {
+				continue
+			}
+		case "healthy":
+			if !n.Enabled || n.DisabledByGuard {
+				continue
+			}
+		}
+		filtered = append(filtered, n)
+	}
+	sortMode := q.Sort
+	if sortMode == "" {
+		sortMode = "status"
+	}
+	sort.SliceStable(filtered, func(i, j int) bool {
+		a, b := filtered[i], filtered[j]
+		var cmp int
+		switch sortMode {
+		case "name":
+			cmp = strings.Compare(a.Name, b.Name)
+			if cmp == 0 {
+				cmp = compareNodeID(a.ID, b.ID)
+			}
+		case "id":
+			cmp = compareNodeID(a.ID, b.ID)
+		default:
+			rank := func(n *nodeRecord) int {
+				if !n.Enabled {
+					return 2
+				}
+				if n.DisabledByGuard {
+					return 1
+				}
+				return 0
+			}
+			cmp = rank(a) - rank(b)
+			if cmp == 0 {
+				cmp = compareNodeID(a.ID, b.ID)
+			}
+		}
+		if strings.EqualFold(q.Order, "desc") {
+			return cmp > 0
+		}
+		return cmp < 0
+	})
+	pageSize := q.PageSize
+	if pageSize <= 0 {
+		pageSize = 50
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+	total := len(filtered)
+	totalPages := 1
+	if total > 0 {
+		totalPages = (total + pageSize - 1) / pageSize
+	}
+	page := q.Page
+	if page < 1 {
+		page = 1
+	}
+	if page > totalPages {
+		page = totalPages
+	}
+	start := (page - 1) * pageSize
+	end := start + pageSize
+	if start > total {
+		start = total
+	}
+	if end > total {
+		end = total
+	}
+	return nodeListPage{
+		Items:      filtered[start:end],
+		Total:      total,
+		Page:       page,
+		PageSize:   pageSize,
+		TotalPages: totalPages,
+		Summary:    summary,
+	}
+}
+
+func (s *stateStore) proxyIdentityIndex() map[string][]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string][]string{}
+	for _, n := range s.data.Nodes {
+		ident := proxyIdentityV1(n.ProxyURL)
+		if ident == "" {
+			continue
+		}
+		out[ident] = append(out[ident], n.ID)
+	}
+	return out
+}
+
+func (s *stateStore) ignoredIdentitySet() map[string]bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string]bool{}
+	for _, ident := range s.data.IgnoredProxyIdentities {
+		if ident != "" {
+			out[ident] = true
+		}
+	}
+	return out
+}
+
+func (s *stateStore) upsertDiscoveredNodes(inputs []nodeCreateInput) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(inputs) == 0 {
+		return 0, nil
+	}
+	existing := map[string]string{}
+	ignored := map[string]bool{}
+	for _, ident := range s.data.IgnoredProxyIdentities {
+		ignored[ident] = true
+	}
+	for _, n := range s.data.Nodes {
+		ident := proxyIdentityV1(n.ProxyURL)
+		if ident != "" {
+			existing[ident] = n.ID
+		}
+	}
+	previousNextID := s.data.NextID
+	previousRev := s.data.ConfigRevision
+	now := time.Now().UTC()
+	createdIDs := make([]string, 0, len(inputs))
+	created := 0
+	for _, input := range inputs {
+		proxy := strings.TrimSpace(input.ProxyURL)
+		if err := validateProxyURL(proxy); err != nil {
+			continue
+		}
+		ident := proxyIdentityV1(proxy)
+		if ident == "" || ignored[ident] {
+			continue
+		}
+		if _, ok := existing[ident]; ok {
+			continue
+		}
+		id := fmt.Sprintf("%d", s.data.NextID)
+		s.data.NextID++
+		name := strings.TrimSpace(input.Name)
+		if name == "" {
+			name = fmt.Sprintf("Grok 节点 %04d", s.data.NextID-1)
+		}
+		n := &nodeRecord{
+			ID:              id,
+			Name:            name,
+			ProxyURL:        proxy,
+			ProxyURLStored:  proxy,
+			Enabled:         input.Enabled,
+			ProxyPool:       input.ProxyPool,
+			AccountCapacity: input.AccountCapacity,
+			Origin:          nodeOriginDiscovery,
+			ManagementMode:  nodeModeObserve,
+			ProbeStatus:     "unknown",
+			CreatedAt:       now,
+			UpdatedAt:       now,
+		}
+		s.data.Nodes[id] = n
+		existing[ident] = id
+		createdIDs = append(createdIDs, id)
+		created++
+	}
+	if created == 0 {
+		return 0, nil
+	}
+	s.data.ConfigRevision++
+	if err := s.persistLocked(); err != nil {
+		for _, id := range createdIDs {
+			delete(s.data.Nodes, id)
+		}
+		s.data.NextID = previousNextID
+		s.data.ConfigRevision = previousRev
+		return 0, err
+	}
+	return created, nil
 }
 
 func (s *stateStore) getNode(id string) (*nodeRecord, bool) {
@@ -1081,12 +1393,29 @@ func (s *stateStore) deleteNodes(ids []string) error {
 	if len(saved) == 0 {
 		return nil
 	}
+	previousIgnored := append([]string(nil), s.data.IgnoredProxyIdentities...)
+	ignoredSet := map[string]bool{}
+	for _, ident := range s.data.IgnoredProxyIdentities {
+		ignoredSet[ident] = true
+	}
+	for _, n := range saved {
+		if n.Origin != nodeOriginDiscovery {
+			continue
+		}
+		ident := proxyIdentityV1(n.ProxyURL)
+		if ident == "" || ignoredSet[ident] {
+			continue
+		}
+		s.data.IgnoredProxyIdentities = append(s.data.IgnoredProxyIdentities, ident)
+		ignoredSet[ident] = true
+	}
 	previousRev := s.data.ConfigRevision
 	s.data.ConfigRevision++
 	if err := s.persistLocked(); err != nil {
 		for id, n := range saved {
 			s.data.Nodes[id] = n
 		}
+		s.data.IgnoredProxyIdentities = previousIgnored
 		s.data.ConfigRevision = previousRev
 		return err
 	}

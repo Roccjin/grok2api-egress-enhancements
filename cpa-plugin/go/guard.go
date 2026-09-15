@@ -1126,6 +1126,16 @@ func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class
 	if target == nil {
 		return
 	}
+	if strings.EqualFold(strings.TrimSpace(target.ManagementMode), nodeModeObserve) {
+		_, _ = store.updateNode(nodeID, func(n *nodeRecord) error {
+			n.LastReason = "观察模式不隔离: " + reason
+			n.LastClassification = class
+			n.LastOutputTPS = tps
+			return nil
+		})
+		store.appendEvent(guardEvent{Event: "observe_skip_quarantine", NodeID: target.ID, NodeName: target.Name, Reason: reason, Classification: class, OutputTPS: tps})
+		return
+	}
 	if enabledHealthy < pol.MinHealthyNodes {
 		store.bumpAction("suppressed")
 		store.appendEvent(guardEvent{Event: "quarantine_suppressed", NodeID: target.ID, NodeName: target.Name, Reason: "低于最低健康节点数", OutputTPS: tps})
