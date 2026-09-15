@@ -322,21 +322,21 @@ func probeConnectivity(proxyURL string) (exitIP string, latencyMs int64, err err
 }
 
 type qualityResult struct {
-	Classification   string  `json:"classification"`
-	TPS              float64 `json:"tps"`
-	OutputTokens     int64   `json:"output_tokens"`
-	DurationMs       int64   `json:"duration_ms"`
-	FirstTokenMs     int64   `json:"first_token_ms"`
-	HasThinking      bool    `json:"has_thinking,omitempty"`
-	ExpectedMatched  bool    `json:"expected_matched"`
-	ProfileID        string  `json:"profile_id,omitempty"`
-	ProfileName      string  `json:"profile_name,omitempty"`
-	AuthID           string  `json:"auth_id,omitempty"`
-	AuthLabel        string  `json:"auth_label,omitempty"`
-	ExitIP           string  `json:"exit_ip,omitempty"`
-	Error            string  `json:"error,omitempty"`
-	ErrorKind        string  `json:"error_kind,omitempty"`
-	Model            string  `json:"model,omitempty"`
+	Classification  string  `json:"classification"`
+	TPS             float64 `json:"tps"`
+	OutputTokens    int64   `json:"output_tokens"`
+	DurationMs      int64   `json:"duration_ms"`
+	FirstTokenMs    int64   `json:"first_token_ms"`
+	HasThinking     bool    `json:"has_thinking,omitempty"`
+	ExpectedMatched bool    `json:"expected_matched"`
+	ProfileID       string  `json:"profile_id,omitempty"`
+	ProfileName     string  `json:"profile_name,omitempty"`
+	AuthID          string  `json:"auth_id,omitempty"`
+	AuthLabel       string  `json:"auth_label,omitempty"`
+	ExitIP          string  `json:"exit_ip,omitempty"`
+	Error           string  `json:"error,omitempty"`
+	ErrorKind       string  `json:"error_kind,omitempty"`
+	Model           string  `json:"model,omitempty"`
 }
 
 func rotationAllowed(cfg pluginConfig, nodeID string) bool {
@@ -891,12 +891,20 @@ func scheduleCrossVerifyProbe(store *stateStore, nodeID, name, event, reason str
 		OutputTPS:      res.TPS,
 		Reason:         reason,
 	})
-	go func(id string) {
+	if !acceptsBackgroundWork() {
+		endCrossVerify(nodeID)
+		return
+	}
+	id := nodeID
+	goTracked(func() {
 		defer endCrossVerify(id)
+		if !acceptsBackgroundWork() {
+			return
+		}
 		if _, err := runNodeQuality(store, id, ""); err != nil {
 			log.Printf("cross-verify probe failed node=%s err=%v", id, err)
 		}
-	}(nodeID)
+	})
 }
 
 // missingThinkingHit is a pure 降智 sample (enough output, no thinking), not transport instability.
@@ -1082,7 +1090,13 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 	if doRestore {
 		store.bumpAction("restored")
 		store.appendEvent(guardEvent{Event: "node_restored", NodeID: nodeCopy.ID, NodeName: nodeCopy.Name, Classification: "healthy", OutputTPS: res.TPS})
-		go func(nn nodeRecord) { _ = enableAuthsOnNode(&nn) }(nodeCopy)
+		nn := nodeCopy
+		goTracked(func() {
+			if !acceptsBackgroundWork() {
+				return
+			}
+			_ = enableAuthsOnNode(&nn)
+		})
 	}
 	if scheduleCV {
 		// Stat as soft while waiting; active confirmation will record the final class.
@@ -1152,6 +1166,9 @@ func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class
 }
 
 func runNodeConnectivity(store *stateStore, id string) (map[string]any, error) {
+	if !acceptsBackgroundWork() {
+		return nil, fmt.Errorf("插件正在停写，已拒绝新的连通探测")
+	}
 	n, ok := store.getNode(id)
 	if !ok {
 		return nil, fmt.Errorf("节点不存在")
@@ -1181,6 +1198,9 @@ func runNodeConnectivity(store *stateStore, id string) (map[string]any, error) {
 }
 
 func runNodeQuality(store *stateStore, id, profileID string) (map[string]any, error) {
+	if !acceptsBackgroundWork() {
+		return nil, fmt.Errorf("插件正在停写，已拒绝新的质量探测")
+	}
 	n, ok := store.getNode(id)
 	if !ok {
 		return nil, fmt.Errorf("节点不存在")
@@ -1389,7 +1409,7 @@ func busiestEnabledNode(store *stateStore) string {
 
 // backgroundWorker periodically probes quarantined / active mode nodes.
 func startGuardWorker(ctx context.Context, store *stateStore) {
-	go func() {
+	goTracked(func() {
 		// First reconcile is deferred so plugin.register never blocks on
 		// host.auth.list/get (store-install activation path).
 		reconcile := time.NewTimer(3 * time.Second)
@@ -1408,8 +1428,13 @@ func startGuardWorker(ctx context.Context, store *stateStore) {
 				_ = store.Flush()
 				return
 			case <-reconcile.C:
-				refreshAssignedCounts(store)
+				if acceptsBackgroundWork() {
+					refreshAssignedCounts(store)
+				}
 			case <-t.C:
+				if !acceptsBackgroundWork() {
+					continue
+				}
 				tick++
 				pol := store.policy()
 				now := float64(time.Now().Unix())
@@ -1419,20 +1444,16 @@ func startGuardWorker(ctx context.Context, store *stateStore) {
 						continue
 					}
 					if pol.Mode == "active" || pol.Mode == "hybrid" {
-						// light active cadence per node via last probe
 						if n.Enabled && !n.DisabledByGuard && (n.LastProbeAt == 0 || now-n.LastProbeAt >= float64(pol.ActiveIntervalSec)) {
-							// don't stampede — one per tick
 							_, _ = runNodeQuality(store, n.ID, "")
 							break
 						}
 					}
 				}
-				// Assigned counts are maintained on rebalance/migrate; a slow
-				// background reconcile is enough for drift from external edits.
 				if tick%10 == 0 {
 					refreshAssignedCounts(store)
 				}
 			}
 		}
-	}()
+	})
 }

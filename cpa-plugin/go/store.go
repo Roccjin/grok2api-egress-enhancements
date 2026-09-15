@@ -3,29 +3,52 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 )
 
+const (
+	stateSchemaVersion = 2
+	maxStateSnapshots  = 3
+
+	loadStatusOK           = "ok"
+	loadStatusFresh        = "fresh"
+	loadStatusMissing      = "missing"
+	loadStatusPermission   = "permission"
+	loadStatusCorrupt      = "corrupt"
+	loadStatusIncompatible = "incompatible"
+
+	nodeOriginManual    = "manual"
+	nodeOriginDiscovery = "credential_discovery"
+	nodeModeObserve     = "observe"
+	nodeModeManage      = "manage"
+)
+
+type openStoreOptions struct {
+	AllowEmptyCreate bool
+}
+
 type policyConfig struct {
-	Mode                 string  `json:"mode"`
-	ActiveIntervalSec    int     `json:"active_interval_seconds"`
-	PassivePollSec       int     `json:"passive_poll_seconds"`
-	QuarantineSec        int     `json:"quarantine_seconds"`
-	SoftTPS              float64 `json:"soft_tps"`
-	HardTPS              float64 `json:"hard_tps"`
-	ConsecutiveSoft      int     `json:"consecutive_soft"`
-	ConsecutiveErrors    int     `json:"consecutive_errors"`
-	MinHealthyNodes      int     `json:"min_healthy_nodes"`
-	MinGenerationMs      int64   `json:"min_generation_ms"`
-	MinOutputTokens      int64   `json:"min_output_tokens"`
-	Model                string  `json:"model"`
-	DisableAuthOnHard    bool    `json:"disable_auth_on_hard"`
+	Mode              string  `json:"mode"`
+	ActiveIntervalSec int     `json:"active_interval_seconds"`
+	PassivePollSec    int     `json:"passive_poll_seconds"`
+	QuarantineSec     int     `json:"quarantine_seconds"`
+	SoftTPS           float64 `json:"soft_tps"`
+	HardTPS           float64 `json:"hard_tps"`
+	ConsecutiveSoft   int     `json:"consecutive_soft"`
+	ConsecutiveErrors int     `json:"consecutive_errors"`
+	MinHealthyNodes   int     `json:"min_healthy_nodes"`
+	MinGenerationMs   int64   `json:"min_generation_ms"`
+	MinOutputTokens   int64   `json:"min_output_tokens"`
+	Model             string  `json:"model"`
+	DisableAuthOnHard bool    `json:"disable_auth_on_hard"`
 	// ThinkingGuard enables missing-thinking 降智 detection. When false, quality
 	// classification falls back to the original soft/hard Token/s thresholds only.
 	// Absent in old state.json → default true (see normalizePolicy).
@@ -58,6 +81,8 @@ type nodeRecord struct {
 	Enabled              bool      `json:"enabled"`
 	ProxyPool            bool      `json:"proxy_pool"`
 	AccountCapacity      int       `json:"account_capacity"`
+	Origin               string    `json:"origin,omitempty"`
+	ManagementMode       string    `json:"management_mode,omitempty"`
 	ExitIP               string    `json:"exit_ip,omitempty"`
 	ProbeStatus          string    `json:"probe_status,omitempty"`
 	ProbeLatencyMs       int64     `json:"probe_latency_ms,omitempty"`
@@ -86,6 +111,8 @@ type nodeCreateInput struct {
 	Enabled         bool
 	ProxyPool       bool
 	AccountCapacity int
+	Origin          string
+	ManagementMode  string
 }
 
 type guardEvent struct {
@@ -124,39 +151,45 @@ type statistics struct {
 
 // authDegradeRecord tracks per-account 降智 (missing-thinking) hits.
 type authDegradeRecord struct {
-	AuthID         string  `json:"auth_id"`
-	Label          string  `json:"label,omitempty"`
-	DegradedCount  int64   `json:"degraded_count"`
-	SampleCount    int64   `json:"sample_count"`
-	LastAt         float64 `json:"last_at,omitempty"`
-	LastReason     string  `json:"last_reason,omitempty"`
-	LastNodeID     string  `json:"last_node_id,omitempty"`
-	LastNodeName   string  `json:"last_node_name,omitempty"`
-	LastOutputTPS  float64 `json:"last_output_tps,omitempty"`
-	LastSource     string  `json:"last_source,omitempty"`
+	AuthID        string  `json:"auth_id"`
+	Label         string  `json:"label,omitempty"`
+	DegradedCount int64   `json:"degraded_count"`
+	SampleCount   int64   `json:"sample_count"`
+	LastAt        float64 `json:"last_at,omitempty"`
+	LastReason    string  `json:"last_reason,omitempty"`
+	LastNodeID    string  `json:"last_node_id,omitempty"`
+	LastNodeName  string  `json:"last_node_name,omitempty"`
+	LastOutputTPS float64 `json:"last_output_tps,omitempty"`
+	LastSource    string  `json:"last_source,omitempty"`
 }
 
 type guardState struct {
-	Version    int                           `json:"version"`
-	Policy     policyConfig                  `json:"policy"`
-	Nodes      map[string]*nodeRecord        `json:"nodes"`
-	Profiles   map[string]*ProbeProfile      `json:"profiles"`
-	Events     []guardEvent                  `json:"events"`
-	Stats      statistics                    `json:"statistics"`
-	AuthStats  map[string]*authDegradeRecord `json:"auth_stats"`
-	NextID     int                           `json:"next_id"`
-	UpdatedAt  float64                       `json:"updated_at"`
+	Version        int                           `json:"version"`
+	SchemaVersion  int                           `json:"schema_version,omitempty"`
+	ConfigRevision int64                         `json:"config_revision,omitempty"`
+	LastPersistAt  float64                       `json:"last_persist_at,omitempty"`
+	Policy         policyConfig                  `json:"policy"`
+	Nodes          map[string]*nodeRecord        `json:"nodes"`
+	Profiles       map[string]*ProbeProfile      `json:"profiles"`
+	Events         []guardEvent                  `json:"events"`
+	Stats          statistics                    `json:"statistics"`
+	AuthStats      map[string]*authDegradeRecord `json:"auth_stats"`
+	NextID         int                           `json:"next_id"`
+	UpdatedAt      float64                       `json:"updated_at"`
 }
 
 type stateStore struct {
-	mu         sync.Mutex
-	path       string
-	data       guardState
-	dirty      bool
-	flushTimer *time.Timer
-	// flushDelay batches high-frequency observation/event writes so every
-	// usage event does not MarshalIndent+fsync the full state file.
-	flushDelay time.Duration
+	mu             sync.Mutex
+	path           string
+	data           guardState
+	dirty          bool
+	flushTimer     *time.Timer
+	flushDelay     time.Duration
+	loadStatus     string
+	loadError      string
+	lastPersistErr string
+	persistBlocked bool
+	writable       bool
 }
 
 func defaultPolicy() policyConfig {
@@ -257,37 +290,18 @@ func normalizePolicy(p *policyConfig, rawPolicy map[string]any) {
 	if !has("disable_auth_on_hard", "disableAuthOnHard") {
 		p.DisableAuthOnHard = def.DisableAuthOnHard
 	}
+	if !has("thinking_cross_verify", "thinkingCrossVerify") {
+		p.ThinkingCrossVerify = def.ThinkingCrossVerify
+	}
+	if !has("soft_cross_verify", "softCrossVerify") {
+		p.SoftCrossVerify = def.SoftCrossVerify
+	}
 
-	// policy_schema migrations are one-shot product default upgrades.
-	// schema < 2: thinking redesign defaults
-	// schema < 3: soft cross-verify product default (now off)
-	// schema < 4: minimize active probes — both cross-verify flags off,
-	//             quarantine retest 120s -> 1h (only the old product default)
-	if p.PolicySchema < 2 {
-		if !has("consecutive_missing_thinking", "consecutiveMissingThinking") {
-			p.ConsecutiveMissingThinking = def.ConsecutiveMissingThinking
-		}
-		p.ThinkingCrossVerify = def.ThinkingCrossVerify
-		p.SoftCrossVerify = def.SoftCrossVerify
-		if p.QuarantineSec == 120 {
-			p.QuarantineSec = def.QuarantineSec
-		}
+	// Schema bump records the product revision. Explicit operator values stay.
+	// Absent keys already received the current defaults above; do not overwrite
+	// a present true/false just because the packaged default changed.
+	if p.PolicySchema < def.PolicySchema {
 		p.PolicySchema = def.PolicySchema
-	} else if p.PolicySchema < def.PolicySchema {
-		// Live 1.0.8 / current 1.0.9 files are schema 3 with both flags still true.
-		p.ThinkingCrossVerify = def.ThinkingCrossVerify
-		p.SoftCrossVerify = def.SoftCrossVerify
-		if p.QuarantineSec == 120 {
-			p.QuarantineSec = def.QuarantineSec
-		}
-		p.PolicySchema = def.PolicySchema
-	} else {
-		if !has("thinking_cross_verify", "thinkingCrossVerify") {
-			p.ThinkingCrossVerify = def.ThinkingCrossVerify
-		}
-		if !has("soft_cross_verify", "softCrossVerify") {
-			p.SoftCrossVerify = def.SoftCrossVerify
-		}
 	}
 
 	if !p.ThinkingGuard {
@@ -295,36 +309,83 @@ func normalizePolicy(p *policyConfig, rawPolicy map[string]any) {
 	}
 }
 
-func newStateStore(path string) *stateStore {
-	s := &stateStore{path: path, flushDelay: 2 * time.Second}
-	s.data = guardState{
-		Version:  1,
-		Policy:   defaultPolicy(),
-		Nodes:    map[string]*nodeRecord{},
-		Profiles: map[string]*ProbeProfile{},
-		Events:   nil,
-		Stats:    statistics{StartedAt: float64(time.Now().Unix())},
-		NextID:   1,
+func emptyGuardState() guardState {
+	data := guardState{
+		Version:       1,
+		SchemaVersion: stateSchemaVersion,
+		Policy:        defaultPolicy(),
+		Nodes:         map[string]*nodeRecord{},
+		Profiles:      map[string]*ProbeProfile{},
+		Events:        nil,
+		Stats:         statistics{StartedAt: float64(time.Now().Unix())},
+		NextID:        1,
 	}
-	seedBuiltinProfiles(&s.data)
-	_ = s.load()
+	seedBuiltinProfiles(&data)
+	return data
+}
+
+func newStateStore(path string) *stateStore {
+	s, _ := openStateStore(path, openStoreOptions{AllowEmptyCreate: true})
 	return s
 }
 
-func (s *stateStore) load() error {
+func openStateStore(path string, opts openStoreOptions) (*stateStore, error) {
+	s := &stateStore{path: path, flushDelay: 2 * time.Second, data: emptyGuardState()}
+	err := s.load(opts)
+	return s, err
+}
+
+func (s *stateStore) load(opts openStoreOptions) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.loadLocked(opts)
+}
+
+func (s *stateStore) loadLocked(opts openStoreOptions) error {
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			seedBuiltinProfiles(&s.data)
-			return s.persistLocked()
+			if len(listSnapshotPaths(s.path)) > 0 || hasCorruptBackup(s.path) {
+				s.markLoadFailure(loadStatusMissing, "状态文件缺失，但发现备份或损坏副本；已阻止空状态覆盖")
+				return fmt.Errorf("%s", s.loadError)
+			}
+			if !opts.AllowEmptyCreate {
+				s.markLoadFailure(loadStatusMissing, "状态文件不存在；已阻止当作全新安装覆盖")
+				return err
+			}
+			s.loadStatus = loadStatusFresh
+			s.loadError = ""
+			s.persistBlocked = false
+			if perr := s.writeStateLocked(false); perr != nil {
+				s.writable = false
+				s.lastPersistErr = perr.Error()
+				s.dirty = true
+				return perr
+			}
+			s.loadStatus = loadStatusOK
+			return nil
 		}
+		if os.IsPermission(err) {
+			s.writable = false
+			s.markLoadFailure(loadStatusPermission, "状态文件不可读：权限不足")
+			return err
+		}
+		s.markLoadFailure(loadStatusPermission, "读取状态文件失败: "+err.Error())
 		return err
 	}
 	var data guardState
 	if err := json.Unmarshal(raw, &data); err != nil {
+		preserveCorruptFile(s.path, raw)
+		s.markLoadFailure(loadStatusCorrupt, "状态文件 JSON 损坏，已保留原件并阻止覆盖")
 		return err
+	}
+	fileSchema := data.SchemaVersion
+	if fileSchema == 0 {
+		fileSchema = data.Version
+	}
+	if fileSchema > stateSchemaVersion {
+		s.markLoadFailure(loadStatusIncompatible, fmt.Sprintf("状态 schema %d 新于当前插件 %d，已阻止加载", fileSchema, stateSchemaVersion))
+		return fmt.Errorf("%s", s.loadError)
 	}
 	if data.Nodes == nil {
 		data.Nodes = map[string]*nodeRecord{}
@@ -339,8 +400,6 @@ func (s *stateStore) load() error {
 		data.NextID = 1
 	}
 	seedBuiltinProfiles(&data)
-	// Preserve raw policy keys so newly introduced bool defaults stay ON when an
-	// older state.json omitted them (plain bool zero value would look like false).
 	var rawRoot map[string]any
 	_ = json.Unmarshal(raw, &rawRoot)
 	var rawPolicy map[string]any
@@ -353,59 +412,262 @@ func (s *stateStore) load() error {
 	}
 	beforeSchema := 0
 	if rawPolicy != nil {
-		// PolicySchema may be absent (0) in old files.
 		if v, ok := rawPolicy["policy_schema"].(float64); ok {
 			beforeSchema = int(v)
 		}
 	}
 	normalizePolicy(&data.Policy, rawPolicy)
-	// hydrate private proxy field
 	for _, n := range data.Nodes {
-		n.ProxyURL = n.ProxyURLStored
+		hydrateNode(n)
 	}
+	data.SchemaVersion = stateSchemaVersion
 	s.data = data
-	// Persist once when redesign migration ran so defaults become explicit keys.
+	s.loadStatus = loadStatusOK
+	s.loadError = ""
+	s.persistBlocked = false
 	if beforeSchema < defaultPolicy().PolicySchema {
 		s.data.Events = append(s.data.Events, guardEvent{
 			TS:    float64(time.Now().Unix()),
 			Event: "policy_migrated",
 			Reason: fmt.Sprintf(
-				"策略从 schema %d 升级到 %d：交叉验证改为产品默认关，隔离复测仅在仍为 120s 产品默认时改为 3600s",
+				"策略 schema 从 %d 升级到 %d：缺省字段填入当前默认值，已存在的显式布尔/隔离间隔保持不变",
 				beforeSchema, s.data.Policy.PolicySchema,
 			),
 		})
 		if len(s.data.Events) > 100 {
 			s.data.Events = s.data.Events[len(s.data.Events)-100:]
 		}
-		_ = s.persistLocked()
+		if err := s.writeStateLocked(true); err != nil {
+			s.dirty = true
+			s.lastPersistErr = err.Error()
+			return nil
+		}
 	}
 	return nil
 }
 
-// persistLocked writes state; caller MUST hold s.mu.
+func (s *stateStore) markLoadFailure(status, message string) {
+	s.loadStatus = status
+	s.loadError = message
+	s.persistBlocked = true
+	s.dirty = false
+}
+
+func hydrateNode(n *nodeRecord) {
+	if n == nil {
+		return
+	}
+	n.ProxyURL = n.ProxyURLStored
+	if strings.TrimSpace(n.Origin) == "" {
+		n.Origin = nodeOriginManual
+	}
+	if strings.TrimSpace(n.ManagementMode) == "" {
+		n.ManagementMode = nodeModeManage
+	}
+}
+
 func (s *stateStore) persistLocked() error {
+	return s.writeStateLocked(true)
+}
+
+func (s *stateStore) writeStateLocked(snapshot bool) error {
+	if s.persistBlocked {
+		err := fmt.Errorf("状态持久化已阻止：%s", s.loadError)
+		s.lastPersistErr = err.Error()
+		s.dirty = true
+		return err
+	}
+	if strings.TrimSpace(s.path) == "" {
+		err := fmt.Errorf("状态路径未设置")
+		s.lastPersistErr = err.Error()
+		s.dirty = true
+		return err
+	}
+	var last error
+	for attempt := 0; attempt < 3; attempt++ {
+		last = s.writeStateOnceLocked(snapshot)
+		if last == nil {
+			s.dirty = false
+			s.lastPersistErr = ""
+			s.writable = true
+			return nil
+		}
+	}
+	s.dirty = true
+	s.lastPersistErr = last.Error()
+	s.writable = false
+	return last
+}
+
+func (s *stateStore) writeStateOnceLocked(snapshot bool) error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
 		return err
 	}
-	s.data.UpdatedAt = float64(time.Now().Unix())
+	now := float64(time.Now().Unix())
+	s.data.UpdatedAt = now
+	s.data.SchemaVersion = stateSchemaVersion
+	if s.data.Version <= 0 {
+		s.data.Version = 1
+	}
 	for _, n := range s.data.Nodes {
 		n.ProxyURLStored = n.ProxyURL
 	}
-	// Compact JSON is enough for a machine-owned state file and is much
-	// cheaper than MarshalIndent on every observation tick.
 	raw, err := json.Marshal(s.data)
 	if err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	dir := filepath.Dir(s.path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(s.path)+".tmp-")
+	if err != nil {
 		return err
 	}
-	s.dirty = false
-	return os.Rename(tmp, s.path)
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(0o600); err != nil && runtime.GOOS != "windows" {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(raw); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := replaceFile(tmpName, s.path); err != nil {
+		return err
+	}
+	cleanup = false
+	s.data.LastPersistAt = now
+	_ = os.Chmod(s.path, 0o600)
+	if snapshot {
+		_ = snapshotCurrentState(s.path)
+	}
+	return nil
 }
 
-// scheduleFlushLocked coalesces non-critical writes. Caller holds s.mu.
+func snapshotCurrentState(path string) error {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if err := rotateSnapshots(path); err != nil {
+		return err
+	}
+	return copyFile(path, path+".snap-1")
+}
+
+func rotateSnapshots(path string) error {
+	_ = os.Remove(path + fmt.Sprintf(".snap-%d", maxStateSnapshots))
+	for i := maxStateSnapshots - 1; i >= 1; i-- {
+		from := path + fmt.Sprintf(".snap-%d", i)
+		to := path + fmt.Sprintf(".snap-%d", i+1)
+		if _, err := os.Stat(from); err != nil {
+			continue
+		}
+		_ = os.Remove(to)
+		if err := os.Rename(from, to); err != nil {
+			if err := copyFile(from, to); err != nil {
+				return err
+			}
+			_ = os.Remove(from)
+		}
+	}
+	return nil
+}
+
+func listSnapshotPaths(path string) []string {
+	out := make([]string, 0, maxStateSnapshots)
+	for i := 1; i <= maxStateSnapshots; i++ {
+		p := path + fmt.Sprintf(".snap-%d", i)
+		if _, err := os.Stat(p); err == nil {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func hasCorruptBackup(path string) bool {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	prefix := base + ".corrupt-"
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func preserveCorruptFile(path string, raw []byte) {
+	stamp := time.Now().UTC().Format("20060102T150405")
+	backup := path + ".corrupt-" + stamp
+	if _, err := os.Stat(backup); err == nil {
+		return
+	}
+	_ = os.WriteFile(backup, raw, 0o600)
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, in)
+	syncErr := out.Sync()
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
+}
+
+func replaceFile(src, dst string) error {
+	if runtime.GOOS != "windows" {
+		return os.Rename(src, dst)
+	}
+	bak := dst + ".replace-bak"
+	_ = os.Remove(bak)
+	if _, err := os.Stat(dst); err == nil {
+		if err := os.Rename(dst, bak); err != nil {
+			if err2 := os.Remove(dst); err2 != nil {
+				return err
+			}
+		}
+	}
+	if err := os.Rename(src, dst); err != nil {
+		if _, statErr := os.Stat(bak); statErr == nil {
+			_ = os.Rename(bak, dst)
+		}
+		return err
+	}
+	_ = os.Remove(bak)
+	return nil
+}
+
 func (s *stateStore) scheduleFlushLocked() {
 	s.dirty = true
 	delay := s.flushDelay
@@ -422,17 +684,104 @@ func (s *stateStore) scheduleFlushLocked() {
 		if !s.dirty {
 			return
 		}
-		_ = s.persistLocked()
+		_ = s.writeStateLocked(false)
 	})
 }
 
-// flushNowLocked cancels a pending timer and writes immediately. Caller holds s.mu.
 func (s *stateStore) flushNowLocked() error {
 	if s.flushTimer != nil {
 		s.flushTimer.Stop()
 		s.flushTimer = nil
 	}
-	return s.persistLocked()
+	return s.writeStateLocked(true)
+}
+
+func (s *stateStore) health() map[string]any {
+	if s == nil {
+		return map[string]any{"load_status": "uninitialized"}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return map[string]any{
+		"path":               s.path,
+		"load_status":        s.loadStatus,
+		"load_error":         s.loadError,
+		"last_persist_error": s.lastPersistErr,
+		"last_persist_at":    s.data.LastPersistAt,
+		"config_revision":    s.data.ConfigRevision,
+		"schema_version":     s.data.SchemaVersion,
+		"persist_blocked":    s.persistBlocked,
+		"writable":           s.writable,
+		"dirty":              s.dirty,
+		"using_temp_dir":     pathUsesTempDir(s.path),
+		"snapshots":          len(listSnapshotPaths(s.path)),
+	}
+}
+
+func (s *stateStore) restoreLatestSnapshot() error {
+	if s == nil {
+		return fmt.Errorf("状态存储未初始化")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := 1; i <= maxStateSnapshots; i++ {
+		snap := s.path + fmt.Sprintf(".snap-%d", i)
+		raw, err := os.ReadFile(snap)
+		if err != nil {
+			continue
+		}
+		var data guardState
+		if json.Unmarshal(raw, &data) != nil {
+			continue
+		}
+		if err := copyFile(snap, s.path); err != nil {
+			return err
+		}
+		s.persistBlocked = false
+		s.loadError = ""
+		return s.loadLocked(openStoreOptions{AllowEmptyCreate: false})
+	}
+	return fmt.Errorf("没有可用的状态快照")
+}
+
+func (s *stateStore) reinitializeEmpty() error {
+	if s == nil {
+		return fmt.Errorf("状态存储未初始化")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if strings.TrimSpace(s.path) == "" {
+		return fmt.Errorf("状态路径未设置")
+	}
+	s.data = emptyGuardState()
+	s.persistBlocked = false
+	s.loadStatus = loadStatusFresh
+	s.loadError = ""
+	s.dirty = true
+	if err := s.writeStateLocked(true); err != nil {
+		return err
+	}
+	s.loadStatus = loadStatusOK
+	return nil
+}
+
+func pathUsesTempDir(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	tmp, err := filepath.Abs(os.TempDir())
+	if err != nil {
+		return false
+	}
+	sep := string(os.PathSeparator)
+	if !strings.HasSuffix(tmp, sep) {
+		tmp += sep
+	}
+	return strings.HasPrefix(abs, tmp)
 }
 
 // Flush writes any dirty state. Safe for shutdown / tests.
@@ -532,8 +881,16 @@ func (s *stateStore) updatePolicy(p policyConfig) error {
 	if _, ok := s.data.Profiles[p.ActiveProfileID]; !ok {
 		return fmt.Errorf("探针方案 %s 不存在", p.ActiveProfileID)
 	}
+	previous := s.data.Policy
+	previousRev := s.data.ConfigRevision
 	s.data.Policy = p
-	return s.persistLocked()
+	s.data.ConfigRevision++
+	if err := s.persistLocked(); err != nil {
+		s.data.Policy = previous
+		s.data.ConfigRevision = previousRev
+		return err
+	}
+	return nil
 }
 
 func (s *stateStore) listNodes() []*nodeRecord {
@@ -600,12 +957,21 @@ func (s *stateStore) createNodes(inputs []nodeCreateInput) ([]*nodeRecord, error
 		}
 	}
 	previousNextID := s.data.NextID
+	previousRev := s.data.ConfigRevision
 	now := time.Now().UTC()
 	created := make([]*nodeRecord, 0, len(inputs))
 	createdIDs := make([]string, 0, len(inputs))
 	for _, input := range inputs {
 		id := fmt.Sprintf("%d", s.data.NextID)
 		s.data.NextID++
+		origin := strings.TrimSpace(input.Origin)
+		if origin == "" {
+			origin = nodeOriginManual
+		}
+		mode := strings.TrimSpace(input.ManagementMode)
+		if mode == "" {
+			mode = nodeModeManage
+		}
 		n := &nodeRecord{
 			ID:              id,
 			Name:            input.Name,
@@ -614,6 +980,8 @@ func (s *stateStore) createNodes(inputs []nodeCreateInput) ([]*nodeRecord, error
 			Enabled:         input.Enabled,
 			ProxyPool:       input.ProxyPool,
 			AccountCapacity: input.AccountCapacity,
+			Origin:          origin,
+			ManagementMode:  mode,
 			ProbeStatus:     "unknown",
 			CreatedAt:       now,
 			UpdatedAt:       now,
@@ -623,11 +991,13 @@ func (s *stateStore) createNodes(inputs []nodeCreateInput) ([]*nodeRecord, error
 		cp := *n
 		created = append(created, &cp)
 	}
+	s.data.ConfigRevision++
 	if err := s.persistLocked(); err != nil {
 		for _, id := range createdIDs {
 			delete(s.data.Nodes, id)
 		}
 		s.data.NextID = previousNextID
+		s.data.ConfigRevision = previousRev
 		return nil, err
 	}
 	return created, nil
@@ -640,32 +1010,41 @@ func (s *stateStore) updateNode(id string, mut func(*nodeRecord) error) (*nodeRe
 	if !ok {
 		return nil, fmt.Errorf("节点不存在")
 	}
-	beforeGuard := n.DisabledByGuard
-	beforeUntil := n.QuarantinedUntil
-	beforeEnabled := n.Enabled
-	beforeProxy := n.ProxyURL
+	before := *n
 	if err := mut(n); err != nil {
 		return nil, err
 	}
 	if n.ProxyURL != "" {
 		if err := validateProxyURL(n.ProxyURL); err != nil {
+			*n = before
 			return nil, err
 		}
 	}
 	n.UpdatedAt = time.Now().UTC()
-	// Quarantine / enable / proxy changes must hit disk immediately so a crash
-	// cannot resurrect a known-bad egress. Pure observation metrics can wait.
-	critical := n.DisabledByGuard != beforeGuard ||
-		n.QuarantinedUntil != beforeUntil ||
-		n.Enabled != beforeEnabled ||
-		n.ProxyURL != beforeProxy
+	critical := n.DisabledByGuard != before.DisabledByGuard ||
+		n.QuarantinedUntil != before.QuarantinedUntil ||
+		n.Enabled != before.Enabled ||
+		n.ProxyURL != before.ProxyURL
+	structural := n.Name != before.Name ||
+		n.Enabled != before.Enabled ||
+		n.ProxyURL != before.ProxyURL ||
+		n.AccountCapacity != before.AccountCapacity ||
+		n.ProxyPool != before.ProxyPool ||
+		n.Origin != before.Origin ||
+		n.ManagementMode != before.ManagementMode
+	previousRev := s.data.ConfigRevision
+	if structural {
+		s.data.ConfigRevision++
+	}
 	var err error
-	if critical {
+	if critical || structural {
 		err = s.flushNowLocked()
 	} else {
 		s.scheduleFlushLocked()
 	}
 	if err != nil {
+		*n = before
+		s.data.ConfigRevision = previousRev
 		return nil, err
 	}
 	cp := *n
@@ -689,22 +1068,65 @@ func validateProxyURL(raw string) error {
 func (s *stateStore) deleteNodes(ids []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	saved := make(map[string]*nodeRecord, len(ids))
 	for _, id := range ids {
+		n, ok := s.data.Nodes[id]
+		if !ok {
+			continue
+		}
+		cp := *n
+		saved[id] = &cp
 		delete(s.data.Nodes, id)
 	}
-	return s.persistLocked()
+	if len(saved) == 0 {
+		return nil
+	}
+	previousRev := s.data.ConfigRevision
+	s.data.ConfigRevision++
+	if err := s.persistLocked(); err != nil {
+		for id, n := range saved {
+			s.data.Nodes[id] = n
+		}
+		s.data.ConfigRevision = previousRev
+		return err
+	}
+	return nil
 }
 
 func (s *stateStore) setBatchEnabled(ids []string, enabled bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, id := range ids {
-		if n, ok := s.data.Nodes[id]; ok {
-			n.Enabled = enabled
-			n.UpdatedAt = time.Now().UTC()
-		}
+	type prev struct {
+		enabled   bool
+		updatedAt time.Time
 	}
-	return s.persistLocked()
+	saved := map[string]prev{}
+	now := time.Now().UTC()
+	for _, id := range ids {
+		n, ok := s.data.Nodes[id]
+		if !ok {
+			continue
+		}
+		saved[id] = prev{enabled: n.Enabled, updatedAt: n.UpdatedAt}
+		n.Enabled = enabled
+		n.UpdatedAt = now
+	}
+	if len(saved) == 0 {
+		return nil
+	}
+	previousRev := s.data.ConfigRevision
+	s.data.ConfigRevision++
+	if err := s.persistLocked(); err != nil {
+		for id, before := range saved {
+			if n, ok := s.data.Nodes[id]; ok {
+				n.Enabled = before.enabled
+				n.UpdatedAt = before.updatedAt
+			}
+		}
+		s.data.ConfigRevision = previousRev
+		return err
+	}
+	return nil
 }
 
 func (s *stateStore) appendEvent(ev guardEvent) {
@@ -727,7 +1149,6 @@ func (s *stateStore) events() []guardEvent {
 	copy(out, s.data.Events)
 	return out
 }
-
 
 func (s *stateStore) recordAuthObservation(authID, label, source, nodeID, nodeName, class, reason string, tps float64, degraded bool) {
 	authID = strings.TrimSpace(authID)
@@ -813,10 +1234,12 @@ func (s *stateStore) listAuthDegradeStats() []*authDegradeRecord {
 func (s *stateStore) clearAuthDegradeStats() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previous := s.data.AuthStats
 	s.data.AuthStats = map[string]*authDegradeRecord{}
-	_ = s.flushNowLocked()
+	if err := s.flushNowLocked(); err != nil {
+		s.data.AuthStats = previous
+	}
 }
-
 
 func (s *stateStore) stats() statistics {
 	s.mu.Lock()
@@ -917,6 +1340,8 @@ func publicNode(n *nodeRecord) map[string]any {
 		"last_observed_at":     n.LastObservedAt,
 		"last_probe_at":        n.LastProbeAt,
 		"hasProxy":             n.ProxyURL != "",
+		"origin":               n.Origin,
+		"managementMode":       n.ManagementMode,
 		"createdAt":            n.CreatedAt,
 		"updatedAt":            n.UpdatedAt,
 	}
@@ -1005,6 +1430,8 @@ func (s *stateStore) createProfile(in ProbeProfile) (ProbeProfile, error) {
 	if custom >= maxCustomProfiles {
 		return ProbeProfile{}, fmt.Errorf("自定义方案最多 %d 个", maxCustomProfiles)
 	}
+	previousNextID := s.data.NextID
+	previousRev := s.data.ConfigRevision
 	s.data.NextID++
 	in.ID = fmt.Sprintf("p-%d", s.data.NextID)
 	in.UpdatedAt = nowUnix()
@@ -1013,7 +1440,11 @@ func (s *stateStore) createProfile(in ProbeProfile) (ProbeProfile, error) {
 	}
 	cp := in
 	s.data.Profiles[in.ID] = &cp
+	s.data.ConfigRevision++
 	if err := s.persistLocked(); err != nil {
+		delete(s.data.Profiles, in.ID)
+		s.data.NextID = previousNextID
+		s.data.ConfigRevision = previousRev
 		return ProbeProfile{}, err
 	}
 	return in, nil
@@ -1035,9 +1466,14 @@ func (s *stateStore) updateProfile(id string, in ProbeProfile) (ProbeProfile, er
 		return ProbeProfile{}, err
 	}
 	in.UpdatedAt = nowUnix()
+	previous := *existing
+	previousRev := s.data.ConfigRevision
 	cp := in
 	s.data.Profiles[id] = &cp
+	s.data.ConfigRevision++
 	if err := s.persistLocked(); err != nil {
+		s.data.Profiles[id] = &previous
+		s.data.ConfigRevision = previousRev
 		return ProbeProfile{}, err
 	}
 	return in, nil
@@ -1053,9 +1489,19 @@ func (s *stateStore) deleteProfile(id string) error {
 	if existing.BuiltIn {
 		return fmt.Errorf("内置方案不能删除")
 	}
+	previousPolicyID := s.data.Policy.ActiveProfileID
+	previousRev := s.data.ConfigRevision
+	saved := *existing
 	if s.data.Policy.ActiveProfileID == id {
 		s.data.Policy.ActiveProfileID = defaultProbeProfileID()
 	}
 	delete(s.data.Profiles, id)
-	return s.persistLocked()
+	s.data.ConfigRevision++
+	if err := s.persistLocked(); err != nil {
+		s.data.Profiles[id] = &saved
+		s.data.Policy.ActiveProfileID = previousPolicyID
+		s.data.ConfigRevision = previousRev
+		return err
+	}
+	return nil
 }

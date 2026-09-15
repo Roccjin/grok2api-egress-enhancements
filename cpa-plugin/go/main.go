@@ -1,60 +1,5 @@
 package main
 
-/*
-#include <stdint.h>
-#include <stdlib.h>
-
-typedef struct {
-	void* ptr;
-	size_t len;
-} cliproxy_buffer;
-
-typedef int (*cliproxy_host_call_fn)(void*, const char*, const uint8_t*, size_t, cliproxy_buffer*);
-typedef void (*cliproxy_host_free_fn)(void*, size_t);
-
-typedef struct {
-	uint32_t abi_version;
-	void* host_ctx;
-	cliproxy_host_call_fn call;
-	cliproxy_host_free_fn free_buffer;
-} cliproxy_host_api;
-
-typedef int (*cliproxy_plugin_call_fn)(char*, uint8_t*, size_t, cliproxy_buffer*);
-typedef void (*cliproxy_plugin_free_fn)(void*, size_t);
-typedef void (*cliproxy_plugin_shutdown_fn)(void);
-
-typedef struct {
-	uint32_t abi_version;
-	cliproxy_plugin_call_fn call;
-	cliproxy_plugin_free_fn free_buffer;
-	cliproxy_plugin_shutdown_fn shutdown;
-} cliproxy_plugin_api;
-
-extern int cliproxyPluginCall(char*, uint8_t*, size_t, cliproxy_buffer*);
-extern void cliproxyPluginFree(void*, size_t);
-extern void cliproxyPluginShutdown(void);
-
-static const cliproxy_host_api* stored_host;
-
-static void store_host_api(const cliproxy_host_api* host) {
-	stored_host = host;
-}
-
-static int call_host_api(const char* method, const uint8_t* request, size_t request_len, cliproxy_buffer* response) {
-	if (stored_host == NULL || stored_host->call == NULL) {
-		return 1;
-	}
-	return stored_host->call(stored_host->host_ctx, method, request, request_len, response);
-}
-
-static void free_host_buffer(void* ptr, size_t len) {
-	if (stored_host != NULL && stored_host->free_buffer != NULL && ptr != NULL) {
-		stored_host->free_buffer(ptr, len);
-	}
-}
-*/
-import "C"
-
 import (
 	"context"
 	_ "embed"
@@ -63,27 +8,27 @@ import (
 	"html"
 	"net/http"
 	"net/url"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
-	"gopkg.in/yaml.v3"
 )
 
 const (
 	pluginName          = "grok2api-egress"
-	pluginVersion       = "1.1.0"
+	pluginVersion       = "1.2.0"
 	resourcePath        = "/status"
 	managementAPIPath   = "/v0/management/grok2api-egress/api"
 	resourceContentType = "text/html; charset=utf-8"
 	// Prefer the CPA Docker layout; resolveDefaultStateFile falls back when
 	// /CLIProxyAPI is missing (bare-metal / non-standard installs).
 	defaultStateFile = "/CLIProxyAPI/plugin-data/egress-guard/state.json"
+	// Keep the method string local so unit tests compile against the tagged
+	// CLIProxyAPI module even when the local host tree is newer.
+	methodPluginQuiesce = "plugin.quiesce"
 )
 
 //go:embed page.html
@@ -183,73 +128,20 @@ var (
 
 func main() {}
 
-//export cliproxy_plugin_init
-func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
-	// Match official CPA plugins: both host and plugin tables are required.
-	if host == nil || plugin == nil {
-		return 1
-	}
-	C.store_host_api(host)
-	currentConfig.Store(pluginConfig{StateFile: resolveDefaultStateFile()})
-	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
-	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
-	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
-	plugin.shutdown = C.cliproxy_plugin_shutdown_fn(C.cliproxyPluginShutdown)
-	return 0
-}
-
-//export cliproxyPluginCall
-func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
-	// Official CPA plugins always return 0 from call(); errors are carried in the
-	// JSON envelope. A non-zero rc can make some host builds treat the call as a
-	// hard failure even when an error envelope is present.
-	if response != nil {
-		response.ptr = nil
-		response.len = 0
-	}
-	if method == nil {
-		writeResponse(response, errorEnvelope("invalid_method", "method is required"))
-		return 0
-	}
-	var requestBytes []byte
-	if request != nil && requestLen > 0 {
-		requestBytes = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
-	}
-	raw, errHandle := handleMethod(C.GoString(method), requestBytes)
-	if errHandle != nil {
-		writeResponse(response, errorEnvelope("plugin_error", errHandle.Error()))
-		return 0
-	}
-	writeResponse(response, raw)
-	return 0
-}
-
-//export cliproxyPluginFree
-func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
-	if ptr != nil {
-		C.free(ptr)
-	}
-	_ = len
-}
-
-//export cliproxyPluginShutdown
-func cliproxyPluginShutdown() {
-	if workerCancel != nil {
-		workerCancel()
-		workerCancel = nil
-	}
-	if store != nil {
-		_ = store.Flush()
-	}
-}
-
 func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
-	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
-		if err := configure(request); err != nil {
+	case pluginabi.MethodPluginRegister:
+		if err := configureLifecycle(request, false); err != nil {
 			return nil, err
 		}
 		return okEnvelope(pluginRegistration())
+	case pluginabi.MethodPluginReconfigure:
+		if err := configureLifecycle(request, true); err != nil {
+			return nil, err
+		}
+		return okEnvelope(pluginRegistration())
+	case methodPluginQuiesce:
+		return quiescePlugin()
 	case pluginabi.MethodManagementRegister:
 		return okEnvelope(managementRegistration{
 			Routes:    []managementRoute{{Method: http.MethodPost, Path: "/grok2api-egress/api", Description: "CPA 出口守护 UI API"}},
@@ -270,67 +162,20 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	}
 }
 
-func configure(raw []byte) error {
-	// Keep register/reconfigure cheap and free of host callbacks.
-	// Store install + hot enable run plugin.register while CPA still holds the
-	// apply lock; a synchronous host.auth.list/get stampede (dozens of accounts)
-	// can stall or fail registration and leave the plugin as 未注册/未生效.
-	var req lifecycleRequest
-	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return err
-		}
-	}
-	cfg := pluginConfig{StateFile: resolveDefaultStateFile()}
-	if len(req.ConfigYAML) > 0 {
-		// Store installs pass the full plugins.configs.<id> YAML (enabled, store
-		// manifest, priority, …). Only our keys are decoded; unknown fields are
-		// ignored by yaml.v3. A decode failure must not block registration —
-		// fall back to defaults so the plugin still becomes 生效中.
-		if err := yaml.Unmarshal(req.ConfigYAML, &cfg); err != nil {
-			cfg = pluginConfig{StateFile: resolveDefaultStateFile()}
-		}
-	}
-	if strings.TrimSpace(cfg.StateFile) == "" {
-		cfg.StateFile = resolveDefaultStateFile()
-	}
-	if cfg.RotationTimeoutSec <= 0 {
-		cfg.RotationTimeoutSec = 45
-	}
-	currentConfig.Store(cfg)
-	store = newStateStore(cfg.StateFile)
-	if workerCancel != nil {
-		workerCancel()
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	workerCancel = cancel
-	startGuardWorker(ctx, store)
-	// Assigned counts are reconciled by the background worker; never block
-	// register on host.auth.* round-trips.
-	return nil
-}
-
-// resolveDefaultStateFile picks a writable state path.
-// Order: CPA Docker layout → cwd-relative plugin-data → temp dir fallback.
+// resolveDefaultStateFile picks a stable official state path.
+// Order: CPA Docker layout → cwd-relative plugin-data. Never silently fall
+// back to a temp directory; temp paths are diagnostic-only and must be warned.
 func resolveDefaultStateFile() string {
 	candidates := []string{
 		defaultStateFile,
 		"plugin-data/egress-guard/state.json",
 	}
 	for _, path := range candidates {
-		dir := filepath.Dir(path)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			continue
+		if dirWritable(filepath.Dir(path)) {
+			return path
 		}
-		// Prove the directory is writable without leaving junk when possible.
-		probe := filepath.Join(dir, ".write-probe")
-		if err := os.WriteFile(probe, []byte("ok"), 0o644); err != nil {
-			continue
-		}
-		_ = os.Remove(probe)
-		return path
 	}
-	return filepath.Join(os.TempDir(), "grok2api-egress-guard", "state.json")
+	return defaultStateFile
 }
 
 func pluginRegistration() registration {
@@ -409,6 +254,9 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 		path = "/"
 	}
 	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if store == nil && path != "/status" && path != "/quality-guard" {
+		return managementJSON(http.StatusServiceUnavailable, errMsg("storageUnavailable", "状态存储不可用，请检查配置或从快照恢复"))
+	}
 
 	switch {
 	case path == "/status" || path == "/quality-guard":
@@ -416,6 +264,37 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			return managementJSON(http.StatusMethodNotAllowed, errMsg("methodNotAllowed", "method not allowed"))
 		}
 		return managementJSON(http.StatusOK, buildStatus())
+
+	case path == "/storage/restore":
+		if method != http.MethodPost {
+			return managementJSON(http.StatusMethodNotAllowed, errMsg("methodNotAllowed", "method not allowed"))
+		}
+		ensureStore()
+		if store == nil {
+			return managementJSON(http.StatusConflict, errMsg("storageUnavailable", "状态存储未初始化"))
+		}
+		if err := store.restoreLatestSnapshot(); err != nil {
+			return managementJSON(http.StatusBadRequest, errMsg("restoreFailed", err.Error()))
+		}
+		return managementJSON(http.StatusOK, map[string]any{"ok": true, "storage": store.health()})
+
+	case path == "/storage/reinitialize":
+		if method != http.MethodPost {
+			return managementJSON(http.StatusMethodNotAllowed, errMsg("methodNotAllowed", "method not allowed"))
+		}
+		var raw map[string]any
+		_ = json.Unmarshal(body, &raw)
+		if confirmed, _ := raw["confirm"].(bool); !confirmed {
+			return managementJSON(http.StatusBadRequest, errMsg("confirmRequired", "重新初始化会清空节点和策略，请显式传入 confirm=true"))
+		}
+		ensureStore()
+		if store == nil {
+			return managementJSON(http.StatusConflict, errMsg("storageUnavailable", "状态存储未初始化"))
+		}
+		if err := store.reinitializeEmpty(); err != nil {
+			return managementJSON(http.StatusBadRequest, errMsg("reinitializeFailed", err.Error()))
+		}
+		return managementJSON(http.StatusOK, map[string]any{"ok": true, "storage": store.health()})
 
 	case path == "/policy" || path == "/quality-guard/config":
 		if method == http.MethodGet {
@@ -777,7 +656,6 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 	return managementJSON(http.StatusNotFound, errMsg("notFound", "not found"))
 }
 
-
 func renderPageHTML() string {
 	out := pageTemplate
 	out = strings.Replace(out, "/*__HALLMARK_TOKENS__*/", tokenCSS, 1)
@@ -788,6 +666,19 @@ func renderPageHTML() string {
 
 func buildStatus() map[string]any {
 	ensureStore()
+	if store == nil {
+		return map[string]any{
+			"available":  false,
+			"editable":   false,
+			"plugin":     pluginName,
+			"version":    pluginVersion,
+			"started_at": startedAt.Format(time.RFC3339),
+			"engine":     "cpa-native",
+			"storage":    map[string]any{"load_status": "uninitialized"},
+			"lifecycle":  lifecycleStatus(),
+			"hint":       "配置或状态未能加载，管理入口仍可用。",
+		}
+	}
 	refreshAssignedCounts(store)
 	nodes := store.listNodes()
 	nodeMap := map[string]any{}
@@ -797,7 +688,7 @@ func buildStatus() map[string]any {
 			"quarantined_until":   n.QuarantinedUntil,
 			"error_strikes":       n.ErrorStrikes,
 			"soft_strikes":        n.SoftStrikes,
-				"thinking_strikes":    n.ThinkingStrikes,
+			"thinking_strikes":    n.ThinkingStrikes,
 			"last_classification": n.LastClassification,
 			"last_output_tps":     n.LastOutputTPS,
 			"last_first_token_ms": n.LastFirstTokenMs,
@@ -813,8 +704,17 @@ func buildStatus() map[string]any {
 	st := store.stats()
 	authStats := store.listAuthDegradeStats()
 	profiles := store.listProfiles()
+	health := store.health()
+	life := lifecycleStatus()
+	available := true
+	if blocked, _ := health["persist_blocked"].(bool); blocked {
+		available = false
+	}
+	if status, _ := health["load_status"].(string); status != "" && status != loadStatusOK && status != loadStatusFresh {
+		available = false
+	}
 	return map[string]any{
-		"available":    true,
+		"available":    available,
 		"updatedAt":    store.snapshot().UpdatedAt,
 		"config":       pol,
 		"editable":     true,
@@ -827,6 +727,8 @@ func buildStatus() map[string]any {
 		"version":      pluginVersion,
 		"started_at":   startedAt.Format(time.RFC3339),
 		"engine":       "cpa-native",
+		"storage":      health,
+		"lifecycle":    life,
 		"hint":         "纯 CPA 出口守护：节点代理写在账号 proxy_url，被动 Token/s 审计 + 主动质量探测，不依赖 Grok2API。",
 	}
 }
@@ -858,6 +760,9 @@ func profileIDFrom(query url.Values, body json.RawMessage) string {
 
 func handleUsage(request []byte) ([]byte, error) {
 	ensureStore()
+	if store == nil {
+		return okEnvelope(map[string]any{"recorded": false})
+	}
 	var payload map[string]any
 	if len(request) > 0 {
 		_ = json.Unmarshal(request, &payload)
@@ -871,15 +776,34 @@ func handleUsage(request []byte) ([]byte, error) {
 }
 
 func ensureStore() {
-	if store == nil {
-		cfg := pluginConfig{StateFile: defaultStateFile}
-		if v := currentConfig.Load(); v != nil {
-			if c, ok := v.(pluginConfig); ok {
-				cfg = c
-			}
-		}
-		store = newStateStore(cfg.StateFile)
+	if store != nil {
+		return
 	}
+	life.mu.Lock()
+	if life.store != nil {
+		store = life.store
+		life.mu.Unlock()
+		return
+	}
+	warning := life.pathWarning
+	yamlErr := life.yamlError
+	cfg := life.cfg
+	life.mu.Unlock()
+	if yamlErr != "" && strings.TrimSpace(cfg.StateFile) == "" {
+		return
+	}
+	if warning != "" && strings.TrimSpace(cfg.StateFile) == "" {
+		return
+	}
+	if v := currentConfig.Load(); v != nil {
+		if c, ok := v.(pluginConfig); ok && strings.TrimSpace(c.StateFile) != "" {
+			cfg = c
+		}
+	}
+	if strings.TrimSpace(cfg.StateFile) == "" {
+		return
+	}
+	store = newStateStore(cfg.StateFile)
 }
 
 func managementJSON(status int, v any) ([]byte, error) {
@@ -992,38 +916,6 @@ func mustJSON(v any) []byte {
 	return raw
 }
 
-func callHost(method string, payload []byte) (json.RawMessage, error) {
-	cMethod := C.CString(method)
-	defer C.free(unsafe.Pointer(cMethod))
-	var response C.cliproxy_buffer
-	var reqPtr *C.uint8_t
-	if len(payload) > 0 {
-		reqPtr = (*C.uint8_t)(C.CBytes(payload))
-		defer C.free(unsafe.Pointer(reqPtr))
-	}
-	code := C.call_host_api(cMethod, reqPtr, C.size_t(len(payload)), &response)
-	if code != 0 {
-		return nil, fmt.Errorf("host callback %s code=%d", method, int(code))
-	}
-	if response.ptr == nil || response.len == 0 {
-		return nil, fmt.Errorf("host callback %s empty", method)
-	}
-	raw := C.GoBytes(response.ptr, C.int(response.len))
-	C.free_host_buffer(response.ptr, response.len)
-	var env envelope
-	if err := json.Unmarshal(raw, &env); err != nil {
-		return raw, nil
-	}
-	if !env.OK {
-		msg := "host error"
-		if env.Error != nil {
-			msg = env.Error.Message
-		}
-		return nil, fmt.Errorf("%s", msg)
-	}
-	return append(json.RawMessage(nil), env.Result...), nil
-}
-
 func okEnvelope(v any) ([]byte, error) {
 	raw, err := json.Marshal(v)
 	if err != nil {
@@ -1035,19 +927,6 @@ func okEnvelope(v any) ([]byte, error) {
 func errorEnvelope(code, message string) []byte {
 	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{Code: code, Message: message}})
 	return raw
-}
-
-func writeResponse(response *C.cliproxy_buffer, raw []byte) {
-	if response == nil {
-		return
-	}
-	if len(raw) == 0 {
-		response.ptr = nil
-		response.len = 0
-		return
-	}
-	response.ptr = C.CBytes(raw)
-	response.len = C.size_t(len(raw))
 }
 
 // silence unused html import used by tests/templates indirectly

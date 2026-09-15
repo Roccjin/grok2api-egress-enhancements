@@ -174,7 +174,6 @@ func TestProbeUnstableErrDetection(t *testing.T) {
 	}
 }
 
-
 func TestDefaultPolicyDefaults(t *testing.T) {
 	pol := defaultPolicy()
 	if !pol.ThinkingGuard {
@@ -237,11 +236,11 @@ func TestNormalizePolicyFillsAbsentBoolDefaults(t *testing.T) {
 		"quarantine_seconds":    120,
 		"policy_schema":         3,
 	})
-	if pLive.ThinkingCrossVerify || pLive.SoftCrossVerify {
-		t.Fatal("schema 3 leftover cross-verify flags must migrate off")
+	if !pLive.ThinkingCrossVerify || !pLive.SoftCrossVerify {
+		t.Fatal("explicit schema 3 cross-verify flags must be preserved")
 	}
-	if pLive.QuarantineSec != 3600 {
-		t.Fatalf("schema 3 leftover quarantine 120s must migrate to 3600, got %d", pLive.QuarantineSec)
+	if pLive.QuarantineSec != 120 {
+		t.Fatalf("explicit quarantine 120s must stay, got %d", pLive.QuarantineSec)
 	}
 	if pLive.PolicySchema != 4 {
 		t.Fatalf("live leftover policy_schema=%d, want 4", pLive.PolicySchema)
@@ -389,8 +388,6 @@ func TestSoftCrossVerifySchedulesInsteadOfQuarantine(t *testing.T) {
 	endCrossVerify(node.ID)
 }
 
-
-
 func TestAuthDegradeCountsPassiveEvenWhenCrossVerifyScheduled(t *testing.T) {
 	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
 	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
@@ -506,8 +503,8 @@ func TestLoadMigratesSchemaAndRecordsEvent(t *testing.T) {
 	}
 	s := newStateStore(path)
 	pol := s.policy()
-	if pol.PolicySchema != 4 || pol.ThinkingCrossVerify || pol.SoftCrossVerify || pol.QuarantineSec != 3600 {
-		t.Fatalf("migrated policy=%+v", pol)
+	if pol.PolicySchema != 4 || !pol.ThinkingCrossVerify || !pol.SoftCrossVerify || pol.QuarantineSec != 120 {
+		t.Fatalf("migrated policy must keep explicit flags and 120s quarantine, got %+v", pol)
 	}
 	found := false
 	for _, ev := range s.events() {
@@ -744,10 +741,9 @@ func TestConfigureAcceptsStoreInstallYAMLWithoutHostAuth(t *testing.T) {
 	prevStore := store
 	prevCancel := workerCancel
 	prevHost := hostCall
+	resetLifecycleForTest()
 	t.Cleanup(func() {
-		if workerCancel != nil {
-			workerCancel()
-		}
+		resetLifecycleForTest()
 		workerCancel = prevCancel
 		store = prevStore
 		hostCall = prevHost
@@ -805,10 +801,9 @@ store:
 func TestConfigureFallsBackWhenYAMLIsGarbage(t *testing.T) {
 	prevStore := store
 	prevCancel := workerCancel
+	resetLifecycleForTest()
 	t.Cleanup(func() {
-		if workerCancel != nil {
-			workerCancel()
-		}
+		resetLifecycleForTest()
 		workerCancel = prevCancel
 		store = prevStore
 	})
@@ -816,8 +811,45 @@ func TestConfigureFallsBackWhenYAMLIsGarbage(t *testing.T) {
 	if err := configure(lifecycle); err != nil {
 		t.Fatalf("configure must tolerate bad yaml: %v", err)
 	}
+	if store != nil {
+		t.Fatal("first-run garbage YAML must not initialize an empty store on a guessed path")
+	}
+	st := lifecycleStatus()
+	if st["yaml_error"] == "" {
+		t.Fatal("yaml error must be visible")
+	}
+	if currentPhase() != phaseDegraded {
+		t.Fatalf("phase=%q want degraded", currentPhase())
+	}
+}
+
+func TestConfigureKeepsPreviousConfigOnBadYAML(t *testing.T) {
+	prevStore := store
+	prevCancel := workerCancel
+	resetLifecycleForTest()
+	t.Cleanup(func() {
+		resetLifecycleForTest()
+		workerCancel = prevCancel
+		store = prevStore
+	})
+	statePath := filepath.Join(t.TempDir(), "keep", "state.json")
+	good, err := json.Marshal(lifecycleRequest{ConfigYAML: []byte("state_file: " + statePath + "\n")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := configure(good); err != nil {
+		t.Fatal(err)
+	}
 	if store == nil {
-		t.Fatal("store must still be initialized")
+		t.Fatal("expected store from valid yaml")
+	}
+	bad, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte(":\n  - not: valid")})
+	if err := configure(bad); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := currentConfig.Load().(pluginConfig)
+	if cfg.StateFile != statePath {
+		t.Fatalf("state_file=%q want previous %q", cfg.StateFile, statePath)
 	}
 }
 
@@ -859,7 +891,7 @@ func TestStoreCreateNodesIsAllOrNothing(t *testing.T) {
 
 func TestRenderStatusPage(t *testing.T) {
 	page := strings.Replace(pageTemplate, "/*__HALLMARK_TOKENS__*/", tokenCSS, 1)
-	for _, want := range []string{"出口守护", "纯 CPA", "data-batch=\"enable\"", "重平衡账号", "批量添加", "/nodes/import", "页面每 15 秒刷新", "最短生成窗口", "X-Grok2API-Egress-UI"} {
+	for _, want := range []string{"出口守护", "纯 CPA", "data-batch=\"enable\"", "重平衡账号", "批量添加", "/nodes/import", "页面每 15 秒刷新", "最短生成窗口", "X-Grok2API-Egress-UI", "选择本页节点", "nodes-pager", "每页 50"} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("missing %q", want)
 		}
@@ -1134,5 +1166,160 @@ func TestBuiltinProfilesSeededAndCustomCRUD(t *testing.T) {
 	}
 	if store.policy().ActiveProfileID != profileThroughput {
 		t.Fatalf("delete active should fall back, got %s", store.policy().ActiveProfileID)
+	}
+}
+
+func TestStoreLoadCorruptDoesNotOverwrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	original := []byte("{not-json")
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := openStateStore(path, openStoreOptions{AllowEmptyCreate: true})
+	if err == nil {
+		t.Fatal("corrupt JSON must fail load")
+	}
+	if s.loadStatus != loadStatusCorrupt {
+		t.Fatalf("loadStatus=%q", s.loadStatus)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != string(original) {
+		t.Fatalf("corrupt file was overwritten: %q err=%v", got, err)
+	}
+	if _, err := s.createNode("n", "http://127.0.0.1:1", true, false, 0); err == nil {
+		t.Fatal("persist must stay blocked on corrupt state")
+	}
+	got, _ = os.ReadFile(path)
+	if string(got) != string(original) {
+		t.Fatal("blocked persist must not replace corrupt file")
+	}
+}
+
+func TestStoreMissingWithSnapshotDoesNotCreateEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	s := newStateStore(path)
+	if _, err := s.createNode("keep", "http://127.0.0.1:7951", true, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := openStateStore(path, openStoreOptions{AllowEmptyCreate: true})
+	if err == nil {
+		t.Fatal("missing file with snapshot must not look like a fresh install")
+	}
+	if s2.loadStatus != loadStatusMissing {
+		t.Fatalf("loadStatus=%q", s2.loadStatus)
+	}
+	if _, statErr := os.Stat(path); statErr == nil {
+		t.Fatal("must not recreate empty state over a missing known file")
+	}
+	if err := s2.restoreLatestSnapshot(); err != nil {
+		t.Fatal(err)
+	}
+	n, ok := s2.getNode("1")
+	if !ok || n.ProxyURL != "http://127.0.0.1:7951" {
+		t.Fatalf("restored node=%#v ok=%v", n, ok)
+	}
+}
+
+func TestStorePersistFailureKeepsDirtyAndRollsBack(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	s := newStateStore(path)
+	if _, err := s.createNode("n1", "http://127.0.0.1:7951", true, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	blocker := filepath.Join(dir, "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.path = filepath.Join(blocker, "state.json")
+	s.mu.Unlock()
+	if _, err := s.createNode("n2", "http://127.0.0.1:7952", true, false, 0); err == nil {
+		t.Fatal("expected persist failure")
+	}
+	s.mu.Lock()
+	dirty := s.dirty
+	lastErr := s.lastPersistErr
+	s.mu.Unlock()
+	if !dirty {
+		t.Fatal("failed persist must keep dirty")
+	}
+	if lastErr == "" {
+		t.Fatal("failed persist must record last_persist_error")
+	}
+	if len(s.listNodes()) != 1 {
+		t.Fatalf("memory must roll back failed create, got %d nodes", len(s.listNodes()))
+	}
+}
+
+func TestQuiesceStopsBackgroundWork(t *testing.T) {
+	prevStore := store
+	prevCancel := workerCancel
+	resetLifecycleForTest()
+	t.Cleanup(func() {
+		resetLifecycleForTest()
+		workerCancel = prevCancel
+		store = prevStore
+	})
+	statePath := filepath.Join(t.TempDir(), "q", "state.json")
+	lifecycle, err := json.Marshal(lifecycleRequest{ConfigYAML: []byte("state_file: " + statePath + "\n")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := configure(lifecycle); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := handleMethod(methodPluginQuiesce, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil || !env.OK {
+		t.Fatalf("quiesce envelope ok=%v err=%v raw=%s", env.OK, err, raw)
+	}
+	if currentPhase() != phaseQuiesced {
+		t.Fatalf("phase=%q", currentPhase())
+	}
+	if _, err := runNodeQuality(store, "missing", ""); err == nil {
+		t.Fatal("quality probe must be rejected after quiesce")
+	}
+}
+
+func TestConfigureReusesWorkerWhenUnchanged(t *testing.T) {
+	prevStore := store
+	prevCancel := workerCancel
+	resetLifecycleForTest()
+	t.Cleanup(func() {
+		resetLifecycleForTest()
+		workerCancel = prevCancel
+		store = prevStore
+	})
+	statePath := filepath.Join(t.TempDir(), "reuse", "state.json")
+	lifecycle, err := json.Marshal(lifecycleRequest{ConfigYAML: []byte("state_file: " + statePath + "\n")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := configureLifecycle(lifecycle, false); err != nil {
+		t.Fatal(err)
+	}
+	life.mu.Lock()
+	gen := life.generation
+	firstStore := life.store
+	life.mu.Unlock()
+	if err := configureLifecycle(lifecycle, true); err != nil {
+		t.Fatal(err)
+	}
+	life.mu.Lock()
+	defer life.mu.Unlock()
+	if life.generation != gen {
+		t.Fatalf("generation %d -> %d, want reuse", gen, life.generation)
+	}
+	if life.store != firstStore {
+		t.Fatal("reconfigure with same path must keep store")
 	}
 }

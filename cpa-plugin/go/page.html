@@ -53,7 +53,9 @@
     .section-head h2 { margin: 0; font-size: var(--text-md); font-weight: 650; }
     .section-head p { margin: var(--space-3xs) 0 0; color: var(--muted-foreground); font-size: var(--text-xs); }
     .toolbar { flex-wrap: wrap; justify-content: flex-end; }
+    .toolbar select { width: auto; min-width: 7.5rem; }
     .search { width: min(16rem, 100%); }
+    #storage-banner { color: var(--destructive); }
     input, select, textarea { min-height: 2.25rem; width: 100%; border: var(--rule-hairline) solid var(--input); border-radius: var(--radius-sm); padding: 0 var(--space-xs); background: var(--background); color: var(--foreground); }
     textarea { min-height: 14rem; resize: vertical; padding: var(--space-xs); font-family: var(--font-mono); font-size: var(--text-xs); line-height: 1.6; }
     input:hover, select:hover, textarea:hover { border-color: var(--ring); }
@@ -208,6 +210,7 @@
       <div>
         <h1>出口守护</h1>
         <p>纯 CPA 实现 · 出口质量隔离 · 节点 CRUD · 质量检测 · 账号通道绑定</p>
+        <p id="storage-banner" class="section-note" hidden></p>
       </div>
       <div class="head-actions">
         <span class="status-line"><span id="service-dot" class="status-dot"></span><span id="service-text">正在连接</span></span>
@@ -232,15 +235,32 @@
       <div class="section-head">
         <div><h2 id="nodes-title">出口节点</h2><p id="nodes-freshness">页面每 15 秒刷新；节点健康状态随请求审计或主动检测更新，代理凭据不会回显</p></div>
         <div class="toolbar">
-          <input id="node-search" class="search" type="search" placeholder="搜索节点、IP 或 ID" aria-label="搜索节点">
+          <input id="node-search" class="search" type="search" placeholder="搜索名称 / ID / 出口IP" aria-label="搜索节点">
+          <select id="node-filter-enabled" aria-label="启用情况">
+            <option value="">全部启用情况</option>
+            <option value="true">已启用</option>
+            <option value="false">已停用</option>
+          </select>
+          <select id="node-filter-state" aria-label="状态">
+            <option value="">全部状态</option>
+            <option value="healthy">正常</option>
+            <option value="quarantined">已隔离</option>
+            <option value="disabled">已停用</option>
+          </select>
+          <select id="node-sort" aria-label="排序">
+            <option value="status">状态优先</option>
+            <option value="id">按 ID</option>
+            <option value="name">按名称</option>
+          </select>
           <button id="rebalance-nodes" class="button" type="button" title="按启用节点把 CPA 账号 proxy_url 重新均分">重平衡账号</button>
           <button id="bulk-add-node" class="button" type="button">批量添加</button>
           <button id="add-node" class="button primary" type="button">添加节点</button>
         </div>
       </div>
       <div id="batch-bar" class="batch-bar" hidden>
-        <span id="batch-count">已选择 0 个节点</span>
+        <span id="batch-count">已选 0 个（本页 0 个）</span>
         <div class="batch-actions">
+          <button class="button ghost" type="button" data-batch="clear">清空选择</button>
           <button class="button" type="button" data-batch="enable">启用</button>
           <button class="button" type="button" data-batch="disable">停用</button>
           <button class="button" type="button" data-batch="test">检测连通性</button>
@@ -250,13 +270,27 @@
       <div class="table-wrap desktop-table">
         <table>
           <thead><tr>
-            <th class="check-cell"><input id="select-all" type="checkbox" aria-label="选择所有节点"></th>
+            <th class="check-cell"><input id="select-all" type="checkbox" aria-label="选择本页节点"></th>
             <th>节点</th><th>状态</th><th>出口 IP</th><th class="numeric">输出 Token/s</th><th class="numeric">首字</th><th>账号</th><th>最近观测</th><th class="actions-col">操作</th>
           </tr></thead>
           <tbody id="nodes-body"><tr><td colspan="9" class="loading">正在加载节点</td></tr></tbody>
         </table>
       </div>
       <div id="node-cards" class="node-cards" aria-label="节点卡片"></div>
+      <div id="nodes-pager" class="batch-bar" hidden>
+        <span id="nodes-page-info">第 1 页</span>
+        <div class="batch-actions">
+          <button id="nodes-page-first" class="button" type="button">首页</button>
+          <button id="nodes-page-prev" class="button" type="button">上一页</button>
+          <button id="nodes-page-next" class="button" type="button">下一页</button>
+          <button id="nodes-page-last" class="button" type="button">末页</button>
+          <select id="nodes-page-size" aria-label="每页条数">
+            <option value="20">每页 20</option>
+            <option value="50">每页 50</option>
+            <option value="100">每页 100</option>
+          </select>
+        </div>
+      </div>
     </section>
 
     <section class="section" aria-labelledby="statistics-title">
@@ -401,6 +435,8 @@
     'use strict';
     const PLUGIN_BASE = '/v0/resource/plugins/grok2api-egress';
     const MANAGEMENT_API = '/v0/management/grok2api-egress/api';
+    const PAGE_SIZES = [20, 50, 100];
+    const storedPageSize = Number(localStorage.getItem('egress-guard-page-size') || 50);
     const state = {
       panel: localStorage.getItem('egress-guard-panel') || 'nodes',
       authSearch: '',
@@ -410,6 +446,11 @@
       nodes: [],
       selected: new Set(),
       search: '',
+      nodePage: 1,
+      nodePageSize: PAGE_SIZES.includes(storedPageSize) ? storedPageSize : 50,
+      nodeFilterEnabled: '',
+      nodeFilterState: '',
+      nodeSort: localStorage.getItem('egress-guard-node-sort') || 'status',
       editing: null,
       editingProfile: null,
       confirm: null,
@@ -500,7 +541,8 @@
         state.status = status;
         const items = list.items || list.data?.items || [];
         state.nodes = Array.isArray(items) ? items : [];
-        state.selected = new Set([...state.selected].filter((id) => state.nodes.some((node) => node.id === id)));
+        const known = new Set(state.nodes.map((node) => node.id));
+        state.selected = new Set([...state.selected].filter((id) => known.has(id)));
         render();
         setService(true, status?.engine === 'cpa-native' ? 'CPA 原生守护' : '已连接');
       } catch (error) {
@@ -565,16 +607,46 @@
       if (guard.disabled_by_guard) return 1; // 隔离居中
       return 0; // 正常置顶
     }
+    function compareNodeId(a, b) {
+      const na = Number(a), nb = Number(b);
+      if (Number.isFinite(na) && Number.isFinite(nb) && String(na) === String(a) && String(nb) === String(b) && na !== nb) return na - nb;
+      return String(a || '').localeCompare(String(b || ''), undefined, {numeric: true, sensitivity: 'base'});
+    }
     function filteredNodes() {
       const query = state.search.trim().toLowerCase();
-      const list = !query
-        ? state.nodes.slice()
-        : state.nodes.filter((node) => [node.id,node.name,node.exitIp].some((value) => String(value || '').toLowerCase().includes(query)));
+      let list = state.nodes.slice();
+      if (query) {
+        list = list.filter((node) => [node.id, node.name, node.exitIp].some((value) => String(value || '').toLowerCase().includes(query)));
+      }
+      if (state.nodeFilterEnabled === 'true') list = list.filter((node) => node.enabled);
+      if (state.nodeFilterEnabled === 'false') list = list.filter((node) => !node.enabled);
+      if (state.nodeFilterState === 'quarantined') list = list.filter((node) => nodeGuard(node).disabled_by_guard);
+      if (state.nodeFilterState === 'disabled') list = list.filter((node) => !node.enabled);
+      if (state.nodeFilterState === 'healthy') list = list.filter((node) => node.enabled && !nodeGuard(node).disabled_by_guard);
+      const sortMode = state.nodeSort || 'status';
       return list.sort((a, b) => {
+        if (sortMode === 'name') {
+          const byName = String(a.name || '').localeCompare(String(b.name || ''), 'zh-CN');
+          return byName || compareNodeId(a.id, b.id);
+        }
+        if (sortMode === 'id') return compareNodeId(a.id, b.id);
         const rank = nodeRank(a) - nodeRank(b);
         if (rank !== 0) return rank;
-        return String(a.id || '').localeCompare(String(b.id || ''));
+        return compareNodeId(a.id, b.id);
       });
+    }
+    function pagedNodes() {
+      const nodes = filteredNodes();
+      const pageSize = PAGE_SIZES.includes(Number(state.nodePageSize)) ? Number(state.nodePageSize) : 50;
+      const total = nodes.length;
+      const totalPages = Math.max(1, Math.ceil(total / pageSize) || 1);
+      let page = Number(state.nodePage || 1);
+      if (page > totalPages) page = totalPages;
+      if (page < 1) page = 1;
+      state.nodePage = page;
+      state.nodePageSize = pageSize;
+      const start = (page - 1) * pageSize;
+      return { nodes: nodes.slice(start, start + pageSize), total, page, pageSize, totalPages, matched: total, all: state.nodes.length };
     }
     function nodeRowClass(node, guard) {
       if (!node.enabled) return 'row-disabled';
@@ -619,15 +691,50 @@
         '<button class="button danger" type="button" data-action="delete">删除</button>' +
       '</div>';
     }
+    function renderStorageBanner() {
+      const banner = $('storage-banner');
+      if (!banner) return;
+      const storage = state.status?.storage || {};
+      const life = state.status?.lifecycle || {};
+      const messages = [];
+      if (storage.load_error) messages.push(storage.load_error);
+      if (storage.persist_blocked) messages.push('状态写入已阻止，避免覆盖原文件');
+      if (storage.last_persist_error) messages.push('最近落盘失败：' + storage.last_persist_error);
+      if (storage.using_temp_dir || life.using_temp_dir) messages.push('当前状态文件在临时目录，不能作为正式部署路径');
+      if (life.yaml_error) messages.push('插件 YAML 无效，已保留上一份有效配置');
+      if (life.path_warning) messages.push(life.path_warning);
+      banner.hidden = messages.length === 0;
+      banner.textContent = messages.join('；');
+    }
     function renderNodes() {
-      const nodes = filteredNodes();
+      renderStorageBanner();
+      const page = pagedNodes();
+      const nodes = page.nodes;
+      const pageSelected = nodes.filter((node) => state.selected.has(node.id)).length;
       $('batch-bar').hidden = state.selected.size === 0;
-      $('batch-count').textContent = '已选择 ' + state.selected.size + ' 个节点';
+      $('batch-count').textContent = '已选 ' + state.selected.size + ' 个（本页 ' + pageSelected + ' 个）';
       $('select-all').checked = nodes.length > 0 && nodes.every((node) => state.selected.has(node.id));
       $('select-all').indeterminate = !($('select-all').checked) && nodes.some((node) => state.selected.has(node.id));
+      const pager = $('nodes-pager');
+      if (pager) {
+        pager.hidden = page.all === 0;
+        const info = $('nodes-page-info');
+        if (info) info.textContent = '共 ' + page.all + ' 个节点 · 匹配 ' + page.matched + ' 个 · 第 ' + page.page + ' / ' + page.totalPages + ' 页';
+        const prev = $('nodes-page-prev');
+        const next = $('nodes-page-next');
+        const first = $('nodes-page-first');
+        const last = $('nodes-page-last');
+        if (first) first.disabled = page.page <= 1;
+        if (prev) prev.disabled = page.page <= 1;
+        if (next) next.disabled = page.page >= page.totalPages;
+        if (last) last.disabled = page.page >= page.totalPages;
+        const size = $('nodes-page-size');
+        if (size && String(size.value) !== String(page.pageSize)) size.value = String(page.pageSize);
+      }
       if (!nodes.length) {
-        $('nodes-body').innerHTML = '<tr><td colspan="9" class="empty">' + (state.search ? '没有匹配的节点' : '暂无出口节点') + '</td></tr>';
-        $('node-cards').innerHTML = '<div class="empty">' + (state.search ? '没有匹配的节点' : '暂无出口节点') + '</div>';
+        const empty = (state.search || state.nodeFilterEnabled || state.nodeFilterState) ? '没有匹配的节点' : '暂无出口节点';
+        $('nodes-body').innerHTML = '<tr><td colspan="9" class="empty">' + empty + '</td></tr>';
+        $('node-cards').innerHTML = '<div class="empty">' + empty + '</div>';
         return;
       }
       $('nodes-body').innerHTML = nodes.map((node) => {
@@ -884,7 +991,25 @@
       document.documentElement.dataset.theme = dark ? 'light' : 'dark';
       localStorage.setItem('grok2api-egress-theme', dark ? 'light' : 'dark');
     });
-    $('node-search').addEventListener('input', (event) => { state.search = event.target.value; renderNodes(); });
+    $('node-search').addEventListener('input', (event) => { state.search = event.target.value; state.nodePage = 1; renderNodes(); });
+    $('node-filter-enabled')?.addEventListener('change', (event) => { state.nodeFilterEnabled = event.target.value; state.nodePage = 1; renderNodes(); });
+    $('node-filter-state')?.addEventListener('change', (event) => { state.nodeFilterState = event.target.value; state.nodePage = 1; renderNodes(); });
+    $('node-sort')?.addEventListener('change', (event) => {
+      state.nodeSort = event.target.value || 'status';
+      localStorage.setItem('egress-guard-node-sort', state.nodeSort);
+      renderNodes();
+    });
+    $('nodes-page-prev')?.addEventListener('click', () => { state.nodePage = Math.max(1, Number(state.nodePage || 1) - 1); renderNodes(); });
+    $('nodes-page-next')?.addEventListener('click', () => { state.nodePage = Number(state.nodePage || 1) + 1; renderNodes(); });
+    $('nodes-page-first')?.addEventListener('click', () => { state.nodePage = 1; renderNodes(); });
+    $('nodes-page-last')?.addEventListener('click', () => { state.nodePage = 1e9; renderNodes(); });
+    $('nodes-page-size')?.addEventListener('change', (event) => {
+      const next = Number(event.target.value);
+      state.nodePageSize = PAGE_SIZES.includes(next) ? next : 50;
+      localStorage.setItem('egress-guard-page-size', String(state.nodePageSize));
+      state.nodePage = 1;
+      renderNodes();
+    });
     $('add-node').addEventListener('click', () => openNode());
     $('bulk-add-node').addEventListener('click', () => openModal('bulk-node-modal'));
     $('bulk-node-input').addEventListener('input', (event) => {
@@ -953,7 +1078,8 @@
       finally { busy(button, false); }
     });
     $('select-all').addEventListener('change', (event) => {
-      filteredNodes().forEach((node) => event.target.checked ? state.selected.add(node.id) : state.selected.delete(node.id)); renderNodes();
+      pagedNodes().nodes.forEach((node) => event.target.checked ? state.selected.add(node.id) : state.selected.delete(node.id));
+      renderNodes();
     });
     function handleNodeAction(event) {
       const row = event.target.closest('[data-id]'); const control = event.target.closest('[data-action]');
@@ -973,6 +1099,7 @@
     $('batch-bar').addEventListener('click', (event) => {
       const button = event.target.closest('[data-batch]'); if (!button) return;
       const ids = [...state.selected]; if (!ids.length) return;
+      if (button.dataset.batch === 'clear') { state.selected.clear(); renderNodes(); return; }
       if (button.dataset.batch === 'enable') toggleNodes(ids, true, button);
       if (button.dataset.batch === 'disable') toggleNodes(ids, false, button);
       if (button.dataset.batch === 'test') testConnectivity(ids, button);
@@ -1084,6 +1211,8 @@
       });
     }
     applyPanel();
+    if ($('nodes-page-size')) $('nodes-page-size').value = String(state.nodePageSize);
+    if ($('node-sort')) $('node-sort').value = state.nodeSort;
     load();
     state.autoTimer = window.setInterval(() => { if (document.visibilityState === 'visible') load(true); }, 15000);
   })();
