@@ -253,6 +253,7 @@
             <option value="name">按名称</option>
           </select>
           <button id="rebalance-nodes" class="button" type="button" title="按启用节点把 CPA 账号 proxy_url 重新均分">重平衡账号</button>
+          <button id="enforce-all-nodes" class="button" type="button" title="全部节点改为托管，已判定降智的立即停用账号且不迁号">全部托管隔离</button>
           <button id="discover-nodes" class="button" type="button">从 Grok 凭证发现节点</button>
           <button id="bulk-add-node" class="button" type="button">批量添加</button>
           <button id="add-node" class="button primary" type="button">添加节点</button>
@@ -264,6 +265,7 @@
           <button class="button ghost" type="button" data-batch="clear">清空选择</button>
           <button class="button" type="button" data-batch="enable">启用</button>
           <button class="button" type="button" data-batch="disable">停用</button>
+          <button class="button" type="button" data-batch="manage">改为托管隔离</button>
           <button class="button" type="button" data-batch="test">检测连通性</button>
           <button class="button danger" type="button" data-batch="delete">删除</button>
         </div>
@@ -407,7 +409,8 @@
             </div>
           </section>
 
-          <div class="field full check-row"><div><label for="policy-disable-auth">迁移失败时停用原节点账号</label><p class="help">启用可防止坏出口继续接收请求；手动停用账号不会被自动恢复</p></div><input id="policy-disable-auth" type="checkbox"></div>
+          <div class="field full check-row"><div><label for="policy-migrate-on-quarantine">隔离时迁号</label><p class="help">开启后会把账号 proxy_url 改到其他出口。一对一 IPv6（一账号一条出口）必须关闭，只停用原账号。</p></div><input id="policy-migrate-on-quarantine" type="checkbox"></div>
+          <div class="field full check-row"><div><label for="policy-disable-auth">隔离时停用原节点账号</label><p class="help">不迁号或迁号失败时停用绑定账号；手动停用的账号不会被自动恢复</p></div><input id="policy-disable-auth" type="checkbox"></div>
         </div>
         <div class="modal-actions"><button class="button" type="button" data-close="policy-modal">取消</button><button id="save-policy" class="button primary" type="submit">保存策略</button></div>
       </form>
@@ -807,7 +810,7 @@
         const rowClass = nodeRowClass(node, guard);
         return '<tr class="' + rowClass + '" data-id="' + esc(node.id) + '">' +
           '<td class="check-cell"><input type="checkbox" data-action="select" ' + (state.selected.has(node.id) ? 'checked' : '') + ' aria-label="选择 ' + esc(node.name) + '"></td>' +
-          '<td><div class="node-name" title="' + esc(node.name) + '">' + esc(node.name) + '</div><div class="subtext">ID ' + esc(node.id) + ' · ' + (node.proxyPool ? '代理池' : '固定代理') + '</div></td>' +
+          '<td><div class="node-name" title="' + esc(node.name) + '">' + esc(node.name) + '</div><div class="subtext">ID ' + esc(node.id) + ' · ' + (node.managementMode === 'observe' ? '观察' : '托管') + ' · ' + (node.proxyPool ? '代理池' : '固定代理') + '</div></td>' +
           '<td>' + nodeBadge(node, guard) + '<div class="subtext" title="' + esc(reason) + '">' + esc(reason) + (cd ? ' · ' + cd : '') + '</div></td>' +
           '<td><div>' + esc(node.exitIp || '-') + '</div><div class="subtext">' + esc(node.probeStatus || 'unknown') + ' · ' + number(node.probeLatencyMs) + ' ms</div></td>' +
           '<td class="numeric ' + tpsClass + '">' + (observed ? Number(guard.last_output_tps || 0).toFixed(1) : '-') + '</td>' +
@@ -824,7 +827,7 @@
         const rowClass = nodeRowClass(node, guard);
         return '<article class="node-card ' + rowClass + '" data-id="' + esc(node.id) + '">' +
           '<div class="node-card-head"><div><label><input type="checkbox" data-action="select" ' + (state.selected.has(node.id) ? 'checked' : '') + '> <strong>' + esc(node.name) + '</strong></label>' +
-          '<div class="subtext">ID ' + esc(node.id) + ' · ' + (node.proxyPool ? '代理池' : '固定代理') + '</div></div>' + nodeBadge(node, guard) + '</div>' +
+          '<div class="subtext">ID ' + esc(node.id) + ' · ' + (node.managementMode === 'observe' ? '观察' : '托管') + ' · ' + (node.proxyPool ? '代理池' : '固定代理') + '</div></div>' + nodeBadge(node, guard) + '</div>' +
           '<div class="subtext" title="' + esc(reason) + '">' + esc(reason) + (cd ? ' · ' + cd : '') + '</div>' +
           '<div class="node-card-meta">' +
             '<div><span>出口 IP</span><strong>' + esc(node.exitIp || '-') + '</strong></div>' +
@@ -851,7 +854,7 @@
     function renderEvents() {
       const events = state.status?.recentEvents || [];
       if (!events.length) { $('events-list').innerHTML = '<div class="empty">暂无守护事件</div>'; return; }
-      const names = {node_quarantined:'节点已隔离',node_restored:'节点已恢复',quality_probe_completed:'质量检测完成',thinking_cross_verify_scheduled:'thinking 交叉验证已调度',soft_cross_verify_scheduled:'软阈值交叉验证已调度',node_rotated:'出口 IP 已轮换',node_rotation_failed:'换 IP 失败',quarantine_suppressed:'隔离已抑制',accounts_migrated:'账号已迁移',accounts_migration_failed:'账号迁移失败'};
+      const names = {node_quarantined:'节点已隔离',node_restored:'节点已恢复',quality_probe_completed:'质量检测完成',thinking_cross_verify_scheduled:'thinking 交叉验证已调度',soft_cross_verify_scheduled:'软阈值交叉验证已调度',node_rotated:'出口 IP 已轮换',node_rotation_failed:'换 IP 失败',quarantine_suppressed:'隔离已抑制',observe_skip_quarantine:'观察模式跳过隔离',accounts_migrated:'账号已迁移',accounts_migration_failed:'账号迁移失败',accounts_disabled:'账号已停用',accounts_disable_failed:'账号停用失败'};
       $('events-list').innerHTML = events.slice().reverse().map((event) => '<div class="event"><div><strong>' + esc(names[event.event] || event.event || '守护事件') + ' · ' + esc(event.node_name || ('节点 ' + event.node_id)) + '</strong><small>' + esc(event.reason || event.classification || '-') + (event.output_tps ? ' · ' + Number(event.output_tps).toFixed(1) + ' Token/s' : '') + '</small></div><time>' + relative(event.ts) + '</time></div>').join('');
     }
     function renderPolicy() {
@@ -876,7 +879,8 @@
         ['模型', cfg.model],
         ['探测方案', profileName(cfg.active_profile_id)],
         ['最低健康节点', cfg.min_healthy_nodes],
-        ['迁移失败停用', cfg.disable_auth_on_hard !== false ? '是' : '否']
+        ['隔离时迁号', cfg.migrate_on_quarantine === true ? '是' : '否'],
+        ['隔离时停用账号', cfg.disable_auth_on_hard !== false ? '是' : '否']
       ];
       $('policy-view').innerHTML = values.map((value) => '<div><dt>' + value[0] + '</dt><dd>' + esc(value[1]) + '</dd></div>').join('');
     }
@@ -913,6 +917,7 @@
       $('policy-missing-thinking-count').value = cfg.consecutive_missing_thinking || 1;
       $('policy-thinking-cross-verify').checked = cfg.thinking_guard !== false && cfg.thinking_cross_verify === true;
       $('policy-soft-cross-verify').checked = cfg.soft_cross_verify === true;
+      $('policy-migrate-on-quarantine').checked = cfg.migrate_on_quarantine === true;
       $('policy-disable-auth').checked = cfg.disable_auth_on_hard !== false;
       fillProfileSelect($('policy-profile'), cfg.active_profile_id);
       syncPolicyFormDependencies();
@@ -1006,6 +1011,14 @@
     }
     async function toggleNodes(ids, enabled, button) {
       await mutate(button, () => api('/nodes/batch', {method:'PATCH', body:{ids,enabled}}), (enabled ? '已启用 ' : '已停用 ') + ids.length + ' 个节点');
+      state.selected.clear();
+    }
+    async function setNodesManage(ids, button) {
+      await mutate(button, () => api('/nodes/batch', {method:'PATCH', body:{ids, managementMode:'manage'}}), '已改为托管隔离 ' + ids.length + ' 个节点');
+      state.selected.clear();
+    }
+    async function enforceAllNodes(button) {
+      await mutate(button, () => api('/nodes/batch', {method:'PATCH', body:{all:true, managementMode:'manage'}}), '全部节点已改为托管隔离');
       state.selected.clear();
     }
     async function deleteNodes(ids, button) {
@@ -1156,6 +1169,9 @@
       } catch (error) { toast(error.message, 'error'); }
       finally { busy(button, false); }
     });
+    $('enforce-all-nodes').addEventListener('click', () => {
+      confirmAction('全部托管隔离', '全部节点将改为托管。已判定降智的会立即停用绑定账号，不会改写 proxy_url。一对一 IPv6 拓扑应保持「隔离时迁号」关闭。', (button) => enforceAllNodes(button));
+    });
     $('edit-policy').addEventListener('click', openPolicy);
     $('add-profile').addEventListener('click', () => openProfile(null));
     $('profiles-list').addEventListener('click', (event) => {
@@ -1227,6 +1243,7 @@
       if (button.dataset.batch === 'clear') { state.selected.clear(); renderNodes(); return; }
       if (button.dataset.batch === 'enable') toggleNodes(ids, true, button);
       if (button.dataset.batch === 'disable') toggleNodes(ids, false, button);
+      if (button.dataset.batch === 'manage') confirmAction('改为托管隔离', '选中的 ' + ids.length + ' 个节点将改为托管。已判定降智的会立即停用绑定账号，不会改写 proxy_url。', (confirmButton) => setNodesManage(ids, confirmButton));
       if (button.dataset.batch === 'test') testConnectivity(ids, button);
       if (button.dataset.batch === 'delete') confirmAction('批量删除节点', '将删除选中的 ' + ids.length + ' 个节点，此操作不可撤销。', (confirmButton) => deleteNodes(ids, confirmButton));
     });
@@ -1297,6 +1314,7 @@
         consecutiveMissingThinking: Number($('policy-missing-thinking-count').value) || 1,
         thinkingCrossVerify: thinkingOn && $('policy-thinking-cross-verify').checked,
         softCrossVerify: $('policy-soft-cross-verify').checked,
+        migrateOnQuarantine: $('policy-migrate-on-quarantine').checked,
         disableAuthOnHard: $('policy-disable-auth').checked,
         quarantineSeconds: Number($('policy-quarantine').value),
         minHealthyNodes: Number($('policy-min-healthy').value),

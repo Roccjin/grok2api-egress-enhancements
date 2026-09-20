@@ -65,6 +65,10 @@ type policyConfig struct {
 	// anomaly. Default false: passive observations quarantine directly to minimize
 	// active probes; operators can re-enable confirmation in the panel.
 	SoftCrossVerify      bool `json:"soft_cross_verify"`
+	// MigrateOnQuarantine rewrites quarantined accounts onto other nodes' proxy_url.
+	// Default false: 1:1 sticky egress (one account per IPv6) must only disable the
+	// bound account. Turn on only when several accounts share interchangeable exits.
+	MigrateOnQuarantine  bool `json:"migrate_on_quarantine"`
 	MaxOutputTokensProbe int  `json:"max_output_tokens"`
 	// ActiveProfileID selects the built-in or custom probe recipe used by
 	// automatic and manual quality tests. Empty falls back to throughput.
@@ -213,6 +217,7 @@ func defaultPolicy() policyConfig {
 		ConsecutiveMissingThinking: 1,
 		ThinkingCrossVerify:        false,
 		SoftCrossVerify:            false,
+		MigrateOnQuarantine:        false,
 		MaxOutputTokensProbe:       384,
 		ActiveProfileID:            defaultProbeProfileID(),
 		PolicySchema:               4,
@@ -297,6 +302,9 @@ func normalizePolicy(p *policyConfig, rawPolicy map[string]any) {
 	}
 	if !has("soft_cross_verify", "softCrossVerify") {
 		p.SoftCrossVerify = def.SoftCrossVerify
+	}
+	if !has("migrate_on_quarantine", "migrateOnQuarantine") {
+		p.MigrateOnQuarantine = def.MigrateOnQuarantine
 	}
 
 	// Schema bump records the product revision. Explicit operator values stay.
@@ -1420,6 +1428,91 @@ func (s *stateStore) deleteNodes(ids []string) error {
 		return err
 	}
 	return nil
+}
+
+func normalizeManagementMode(mode string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case nodeModeObserve:
+		return nodeModeObserve, nil
+	case nodeModeManage, "enforce":
+		return nodeModeManage, nil
+	default:
+		return "", fmt.Errorf("管理方式必须是 observe 或 manage")
+	}
+}
+
+func pendingEnforceQuarantine(n *nodeRecord) bool {
+	if n == nil || n.DisabledByGuard {
+		return false
+	}
+	if strings.Contains(n.LastReason, "观察模式不隔离") {
+		return true
+	}
+	return n.LastClassification == "hard" && n.ThinkingStrikes > 0
+}
+
+func quarantineReasonFromNode(n *nodeRecord) string {
+	if n == nil {
+		return "响应缺少 thinking_content（降智）"
+	}
+	reason := strings.TrimSpace(n.LastReason)
+	reason = strings.TrimPrefix(reason, "观察模式不隔离: ")
+	reason = strings.TrimPrefix(reason, "隔离已抑制: ")
+	if reason == "" {
+		return "响应缺少 thinking_content（降智）"
+	}
+	return reason
+}
+
+func (s *stateStore) setBatchManagementMode(ids []string, mode string) ([]string, error) {
+	mode, err := normalizeManagementMode(mode)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	type prev struct {
+		mode      string
+		updatedAt time.Time
+	}
+	saved := map[string]prev{}
+	pending := make([]string, 0)
+	now := time.Now().UTC()
+	seen := map[string]bool{}
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		n, ok := s.data.Nodes[id]
+		if !ok {
+			continue
+		}
+		if n.ManagementMode != mode {
+			saved[id] = prev{mode: n.ManagementMode, updatedAt: n.UpdatedAt}
+			n.ManagementMode = mode
+			n.UpdatedAt = now
+		}
+		if mode == nodeModeManage && pendingEnforceQuarantine(n) {
+			pending = append(pending, id)
+		}
+	}
+	if len(saved) == 0 {
+		return pending, nil
+	}
+	previousRev := s.data.ConfigRevision
+	s.data.ConfigRevision++
+	if err := s.persistLocked(); err != nil {
+		for id, before := range saved {
+			if n, ok := s.data.Nodes[id]; ok {
+				n.ManagementMode = before.mode
+				n.UpdatedAt = before.updatedAt
+			}
+		}
+		s.data.ConfigRevision = previousRev
+		return nil, err
+	}
+	return pending, nil
 }
 
 func (s *stateStore) setBatchEnabled(ids []string, enabled bool) error {

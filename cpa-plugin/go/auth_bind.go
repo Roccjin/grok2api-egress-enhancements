@@ -413,7 +413,7 @@ func disableAuthsOnNode(store *stateStore, node *nodeRecord, reason string) erro
 	if node == nil || node.ProxyURL == "" {
 		return nil
 	}
-	auths, err := listAuthFiles()
+	auths, err := listAuthFilesFresh()
 	if err != nil {
 		return err
 	}
@@ -431,7 +431,7 @@ func enableAuthsOnNode(node *nodeRecord) error {
 	if node == nil || node.ProxyURL == "" {
 		return nil
 	}
-	auths, err := listAuthFiles()
+	auths, err := listAuthFilesFresh()
 	if err != nil {
 		return err
 	}

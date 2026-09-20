@@ -185,6 +185,9 @@ func TestDefaultPolicyDefaults(t *testing.T) {
 	if pol.SoftCrossVerify {
 		t.Fatal("default SoftCrossVerify should be off")
 	}
+	if pol.MigrateOnQuarantine {
+		t.Fatal("default MigrateOnQuarantine should be off")
+	}
 	if pol.ConsecutiveMissingThinking != 1 {
 		t.Fatalf("default consecutive missing thinking=%d, want 1", pol.ConsecutiveMissingThinking)
 	}
@@ -214,6 +217,9 @@ func TestNormalizePolicyFillsAbsentBoolDefaults(t *testing.T) {
 	}
 	if p.SoftCrossVerify {
 		t.Fatal("absent soft_cross_verify must default off")
+	}
+	if p.MigrateOnQuarantine {
+		t.Fatal("absent migrate_on_quarantine must default off")
 	}
 	if p.ConsecutiveMissingThinking != 1 {
 		t.Fatalf("consecutive_missing_thinking=%d, want 1", p.ConsecutiveMissingThinking)
@@ -356,6 +362,137 @@ func TestThinkingCrossVerifySchedulesInsteadOfQuarantine(t *testing.T) {
 		t.Fatal("active missing-thinking confirmation should quarantine")
 	}
 	endCrossVerify(node.ID)
+}
+
+func TestObserveModeSkipsQuarantine(t *testing.T) {
+	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.createNode("n2", "http://127.0.0.1:7952", true, false, 10); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(node.ID, func(n *nodeRecord) error {
+		n.ManagementMode = nodeModeObserve
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pol := store.policy()
+	pol.ThinkingGuard = true
+	pol.ThinkingCrossVerify = false
+	pol.ConsecutiveMissingThinking = 1
+	pol.MinHealthyNodes = 1
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	res := qualityResult{Classification: "hard", HasThinking: false, OutputTokens: 64, TPS: 10, Error: "响应缺少 thinking_content（降智）"}
+	applyObservation(store, node.ID, "passive", res)
+	got, _ := store.getNode(node.ID)
+	if got.DisabledByGuard {
+		t.Fatal("observe mode must not quarantine")
+	}
+	if !strings.Contains(got.LastReason, "观察模式不隔离") {
+		t.Fatalf("last reason=%q", got.LastReason)
+	}
+	found := false
+	for _, ev := range store.events() {
+		if ev.Event == "observe_skip_quarantine" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected observe_skip_quarantine event")
+	}
+}
+
+func TestManageModeQuarantinesWithoutMigrating(t *testing.T) {
+	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.createNode("n2", "http://127.0.0.1:7952", true, false, 10); err != nil {
+		t.Fatal(err)
+	}
+	pol := store.policy()
+	if pol.MigrateOnQuarantine {
+		t.Fatal("test expects default migrate off")
+	}
+	pol.ThinkingGuard = true
+	pol.ThinkingCrossVerify = false
+	pol.MinHealthyNodes = 1
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	res := qualityResult{Classification: "hard", HasThinking: false, OutputTokens: 64, TPS: 10, Error: "响应缺少 thinking_content（降智）"}
+	applyObservation(store, node.ID, "passive", res)
+	got, _ := store.getNode(node.ID)
+	if !got.DisabledByGuard {
+		t.Fatal("manage mode must quarantine")
+	}
+	for _, ev := range store.events() {
+		if ev.Event == "accounts_migrated" || ev.Event == "accounts_migration_failed" {
+			t.Fatalf("migrate must not run when migrate_on_quarantine=false: %+v", ev)
+		}
+	}
+}
+
+func TestBatchManageEnforcesPendingObserveSkip(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.createNode("n2", "http://127.0.0.1:7952", true, false, 10); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(node.ID, func(n *nodeRecord) error {
+		n.ManagementMode = nodeModeObserve
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pol := store.policy()
+	pol.ThinkingCrossVerify = false
+	pol.MinHealthyNodes = 1
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	applyObservation(store, node.ID, "passive", qualityResult{
+		Classification: "hard", HasThinking: false, OutputTokens: 64, TPS: 12,
+		Error: "响应缺少 thinking_content（降智）",
+	})
+	got, _ := store.getNode(node.ID)
+	if got.DisabledByGuard {
+		t.Fatal("precondition: observe skip")
+	}
+	headers := make(http.Header)
+	headers.Set("X-Grok2API-Egress-UI", "1")
+	reqBody, _ := json.Marshal(map[string]any{"all": true, "managementMode": "enforce"})
+	body, _ := json.Marshal(uiProxyRequest{Method: http.MethodPatch, Path: "/nodes/batch", Body: reqBody})
+	raw, err := handleUIProxy(managementRequest{Method: http.MethodPost, Headers: headers, Body: body})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	_ = json.Unmarshal(raw, &env)
+	var resp managementResponse
+	_ = json.Unmarshal(env.Result, &resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d %s", resp.StatusCode, resp.Body)
+	}
+	if !strings.Contains(string(resp.Body), `"enforced":1`) {
+		t.Fatalf("body %s", resp.Body)
+	}
+	got, _ = store.getNode(node.ID)
+	if got.ManagementMode != nodeModeManage {
+		t.Fatalf("mode=%s", got.ManagementMode)
+	}
+	if !got.DisabledByGuard {
+		t.Fatal("pending observe-skip must quarantine after switching to manage")
+	}
 }
 
 func TestSoftCrossVerifySchedulesInsteadOfQuarantine(t *testing.T) {
@@ -891,7 +1028,7 @@ func TestStoreCreateNodesIsAllOrNothing(t *testing.T) {
 
 func TestRenderStatusPage(t *testing.T) {
 	page := strings.Replace(pageTemplate, "/*__HALLMARK_TOKENS__*/", tokenCSS, 1)
-	for _, want := range []string{"出口守护", "纯 CPA", "data-batch=\"enable\"", "重平衡账号", "从 Grok 凭证发现节点", "批量添加", "/nodes/import", "页面每 15 秒刷新", "最短生成窗口", "X-Grok2API-Egress-UI", "选择本页节点", "nodes-pager", "每页 50", "/quality-guard?view=summary"} {
+	for _, want := range []string{"出口守护", "纯 CPA", "data-batch=\"enable\"", "data-batch=\"manage\"", "重平衡账号", "从 Grok 凭证发现节点", "批量添加", "/nodes/import", "页面每 15 秒刷新", "最短生成窗口", "X-Grok2API-Egress-UI", "选择本页节点", "nodes-pager", "每页 50", "/quality-guard?view=summary", "隔离时迁号"} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("missing %q", want)
 		}

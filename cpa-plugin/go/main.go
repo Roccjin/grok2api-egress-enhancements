@@ -19,7 +19,7 @@ import (
 
 const (
 	pluginName          = "grok2api-egress"
-	pluginVersion       = "1.3.0"
+	pluginVersion       = "1.3.1"
 	resourcePath        = "/status"
 	managementAPIPath   = "/v0/management/grok2api-egress/api"
 	resourceContentType = "text/html; charset=utf-8"
@@ -431,6 +431,12 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			if v, ok := raw["softCrossVerify"].(bool); ok {
 				p.SoftCrossVerify = v
 			}
+			if v, ok := raw["migrate_on_quarantine"].(bool); ok {
+				p.MigrateOnQuarantine = v
+			}
+			if v, ok := raw["migrateOnQuarantine"].(bool); ok {
+				p.MigrateOnQuarantine = v
+			}
 			// Cross-verify only makes sense with thinking guard.
 			if !p.ThinkingGuard {
 				p.ThinkingCrossVerify = false
@@ -576,10 +582,29 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			var raw map[string]any
 			_ = json.Unmarshal(body, &raw)
 			ids := stringIDs(raw["ids"])
+			if all, _ := raw["all"].(bool); all {
+				nodes := store.listNodes()
+				ids = make([]string, 0, len(nodes))
+				for _, n := range nodes {
+					ids = append(ids, n.ID)
+				}
+			}
 			if v, ok := raw["enabled"].(bool); ok {
 				_ = store.setBatchEnabled(ids, v)
 			}
-			return managementJSON(http.StatusOK, map[string]any{"ok": true})
+			mode, _ := raw["managementMode"].(string)
+			if mode == "" {
+				mode, _ = raw["management_mode"].(string)
+			}
+			enforced := 0
+			if strings.TrimSpace(mode) != "" {
+				pending, err := applyManagementMode(store, ids, mode)
+				if err != nil {
+					return managementJSON(http.StatusBadRequest, errMsg("updateFailed", err.Error()))
+				}
+				enforced = len(pending)
+			}
+			return managementJSON(http.StatusOK, map[string]any{"ok": true, "updated": len(ids), "enforced": enforced})
 		}
 
 	case path == "/nodes/import":
@@ -673,6 +698,17 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 		if method == http.MethodPut || method == http.MethodPatch {
 			var raw map[string]any
 			_ = json.Unmarshal(body, &raw)
+			mode, _ := raw["managementMode"].(string)
+			if mode == "" {
+				mode, _ = raw["management_mode"].(string)
+			}
+			if strings.TrimSpace(mode) != "" {
+				normalized, err := normalizeManagementMode(mode)
+				if err != nil {
+					return managementJSON(http.StatusBadRequest, errMsg("updateFailed", err.Error()))
+				}
+				mode = normalized
+			}
 			n, err := store.updateNode(id, func(node *nodeRecord) error {
 				if v, ok := raw["name"].(string); ok && strings.TrimSpace(v) != "" {
 					node.Name = strings.TrimSpace(v)
@@ -696,10 +732,23 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 				if strings.TrimSpace(proxy) != "" {
 					node.ProxyURL = strings.TrimSpace(proxy)
 				}
+				if mode != "" {
+					node.ManagementMode = mode
+				}
 				return nil
 			})
 			if err != nil {
 				return managementJSON(http.StatusBadRequest, errMsg("updateFailed", err.Error()))
+			}
+			if mode == nodeModeManage && pendingEnforceQuarantine(n) {
+				class := n.LastClassification
+				if class == "" || class == "ignored" || class == "unknown" {
+					class = "hard"
+				}
+				quarantineNode(store, n.ID, quarantineReasonFromNode(n), n.LastOutputTPS, class)
+				if refreshed, ok := store.getNode(n.ID); ok {
+					n = refreshed
+				}
 			}
 			return managementJSON(http.StatusOK, map[string]any{"data": publicNode(n)})
 		}

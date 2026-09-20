@@ -1156,23 +1156,60 @@ func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class
 	}
 	store.bumpAction("quarantined")
 	store.appendEvent(guardEvent{Event: "node_quarantined", NodeID: updated.ID, NodeName: updated.Name, Reason: reason, Classification: class, OutputTPS: tps})
-	// Move accounts off the bad channel synchronously. The first phase disables
-	// them, so no new request can continue using the quarantined egress while
-	// migration and post-save verification are in flight.
-	if err := migrateAuthsOffNode(store, updated); err != nil {
-		store.appendEvent(guardEvent{Event: "accounts_migration_failed", NodeID: updated.ID, NodeName: updated.Name, Reason: err.Error()})
-		if pol.DisableAuthOnHard {
-			_ = disableAuthsOnNode(store, updated, "egress-guard 降智隔离: "+reason)
+	if pol.MigrateOnQuarantine {
+		// Move accounts off the bad channel synchronously. The first phase disables
+		// them, so no new request can continue using the quarantined egress while
+		// migration and post-save verification are in flight.
+		if err := migrateAuthsOffNode(store, updated); err != nil {
+			store.appendEvent(guardEvent{Event: "accounts_migration_failed", NodeID: updated.ID, NodeName: updated.Name, Reason: err.Error()})
+			if pol.DisableAuthOnHard {
+				_ = disableAuthsOnNode(store, updated, "egress-guard 降智隔离: "+reason)
+			}
+		}
+		if rotated, err := rotateNodeIfConfigured(store, updated); err != nil {
+			store.appendEvent(guardEvent{Event: "node_rotation_failed", NodeID: updated.ID, NodeName: updated.Name, Reason: err.Error()})
+		} else if rotated {
+			// A newly rotated IP gets exactly one real-model confirmation before it
+			// can leave quarantine. A healthy result restores the node; anomalies keep
+			// it isolated for the normal recovery worker.
+			_, _ = runNodeQuality(store, updated.ID, "")
+		}
+		return
+	}
+	// 1:1 sticky egress: keep proxy_url, just take the bound account out of rotation.
+	if pol.DisableAuthOnHard {
+		if err := disableAuthsOnNode(store, updated, "egress-guard 降智隔离: "+reason); err != nil {
+			store.appendEvent(guardEvent{Event: "accounts_disable_failed", NodeID: updated.ID, NodeName: updated.Name, Reason: err.Error()})
+		} else {
+			store.appendEvent(guardEvent{Event: "accounts_disabled", NodeID: updated.ID, NodeName: updated.Name, Reason: "隔离停用原节点账号（未迁号）"})
 		}
 	}
-	if rotated, err := rotateNodeIfConfigured(store, updated); err != nil {
-		store.appendEvent(guardEvent{Event: "node_rotation_failed", NodeID: updated.ID, NodeName: updated.Name, Reason: err.Error()})
-	} else if rotated {
-		// A newly rotated IP gets exactly one real-model confirmation before it
-		// can leave quarantine. A healthy result restores the node; anomalies keep
-		// it isolated for the normal recovery worker.
-		_, _ = runNodeQuality(store, updated.ID, "")
+}
+
+func applyManagementMode(store *stateStore, ids []string, mode string) ([]string, error) {
+	if store == nil {
+		return nil, fmt.Errorf("状态存储未初始化")
 	}
+	pending, err := store.setBatchManagementMode(ids, mode)
+	if err != nil {
+		return nil, err
+	}
+	normalized, _ := normalizeManagementMode(mode)
+	if normalized != nodeModeManage {
+		return pending, nil
+	}
+	for _, id := range pending {
+		n, ok := store.getNode(id)
+		if !ok || n.DisabledByGuard {
+			continue
+		}
+		class := n.LastClassification
+		if class == "" || class == "ignored" || class == "unknown" {
+			class = "hard"
+		}
+		quarantineNode(store, id, quarantineReasonFromNode(n), n.LastOutputTPS, class)
+	}
+	return pending, nil
 }
 
 func runNodeConnectivity(store *stateStore, id string) (map[string]any, error) {
