@@ -343,7 +343,8 @@ python3 cpa-plugin/import_from_g2a.py \
 mode: hybrid
 active_interval_seconds: 1800
 passive_poll_seconds: 5
-quarantine_seconds: 3600
+quarantine_seconds: 1800
+max_failed_retests: 3
 soft_tps: 500
 hard_tps: 1000
 consecutive_soft: 2
@@ -363,7 +364,7 @@ max_output_tokens: 384
 | `mode` | `passive`、`active`、`hybrid` | 生产推荐 `hybrid` |
 | `active_interval_seconds` | 健康节点主动质量探测间隔 | 默认 1800 秒，流量敏感可加长 |
 | `passive_poll_seconds` | 策略保留字段 | 当前 Usage 由 CPA 事件直接推送，不要把它理解成请求日志扫描间隔 |
-| `quarantine_seconds` | 隔离后等待自动复测的时间 | 默认 3600 秒以减少主动复测；已能强制换 IP 时可自行调短 |
+| `quarantine_seconds` | 隔离后等待自动复测的时间 | 默认 1800 秒。到期只复测一次；仍降智则再等一个间隔 |
 | `soft_tps` | 可疑速度阈值 | 连续命中才隔离，先按实测分布调 |
 | `hard_tps` | 硬阈值 | 命中立即隔离；误报代价高时适当上调 |
 | `consecutive_soft` | soft 连续次数 | 默认 2，降低误杀 |
@@ -374,6 +375,7 @@ max_output_tokens: 384
 | `model` | 主动探测模型 | 必须是 CPA/xAI auth 实际可用模型 |
 | `disable_auth_on_hard` | 迁移失败时是否禁用原节点账号 | 建议开启，防止坏出口继续承载请求 |
 | `max_output_tokens` | 主动探测最大输出 | 默认 384，太小不利于稳定计算 TPS |
+| `max_failed_retests` | 连续复测仍降智后永久隔离 | 默认 3。永久后不再自动探测，面板可「再给机会」 |
 
 模式选择：
 
@@ -381,7 +383,7 @@ max_output_tokens: 384
 - `active`：只跑定时检测，不处理被动 Usage；
 - `hybrid`：普通请求实时发现异常，30 分钟主动兜底，推荐使用。
 
-默认后台 worker 每 30 秒扫描一次，所以“隔离 3600 秒”表示到期后的下一个扫描周期触发复测，不保证精确到秒。thinking / soft 交叉验证默认关闭，被动观测达到阈值后直接隔离；需要确认探测时在面板打开。
+默认后台 worker 每 30 秒扫描一次，所以“隔离 1800 秒”表示到期后的下一个扫描周期触发一次复测，不保证精确到秒。复测失败会把窗口再推一个间隔，不会在扫描周期里连打。thinking / soft 交叉验证默认关闭，被动观测达到阈值后直接隔离；需要确认探测时在面板打开。
 
 ## 7. 隔离、迁号和恢复状态机
 
@@ -398,9 +400,11 @@ quarantined
 等待 quarantine_seconds
   |
   v
-真实模型主动复测
-  |-- healthy -> 恢复节点
-  `-- soft/hard/error -> 保持隔离并继续等待
+一次真实模型主动复测（只用本节点绑定账号，含已停用账号）
+  |-- healthy -> 恢复节点，失败次数清零
+  |-- 仍降智 -> 失败次数 +1，再次隔离并再等一个间隔
+  |-- 传输失败 / 无法判定 -> 不计入失败次数，再等一个间隔
+  `-- 连续 max_failed_retests 次仍降智 -> 永久降智，停止自动复测
 ```
 
 几个关键行为：

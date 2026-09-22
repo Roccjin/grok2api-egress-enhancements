@@ -37,10 +37,14 @@ type openStoreOptions struct {
 }
 
 type policyConfig struct {
-	Mode              string  `json:"mode"`
-	ActiveIntervalSec int     `json:"active_interval_seconds"`
-	PassivePollSec    int     `json:"passive_poll_seconds"`
-	QuarantineSec     int     `json:"quarantine_seconds"`
+	Mode              string `json:"mode"`
+	ActiveIntervalSec int    `json:"active_interval_seconds"`
+	PassivePollSec    int    `json:"passive_poll_seconds"`
+	QuarantineSec     int    `json:"quarantine_seconds"`
+	// MaxFailedRetests is how many consecutive failed recovery probes are
+	// allowed before the node is permanently degraded and no longer auto-probed.
+	// Default 3: isolate, wait, retest, and after the third still-degraded retest stop.
+	MaxFailedRetests  int     `json:"max_failed_retests"`
 	SoftTPS           float64 `json:"soft_tps"`
 	HardTPS           float64 `json:"hard_tps"`
 	ConsecutiveSoft   int     `json:"consecutive_soft"`
@@ -64,7 +68,7 @@ type policyConfig struct {
 	// SoftCrossVerify defers soft-TPS isolation until an active probe confirms the
 	// anomaly. Default false: passive observations quarantine directly to minimize
 	// active probes; operators can re-enable confirmation in the panel.
-	SoftCrossVerify      bool `json:"soft_cross_verify"`
+	SoftCrossVerify bool `json:"soft_cross_verify"`
 	// MigrateOnQuarantine rewrites quarantined accounts onto other nodes' proxy_url.
 	// Default false: 1:1 sticky egress (one account per IPv6) must only disable the
 	// bound account. Turn on only when several accounts share interchangeable exits.
@@ -79,35 +83,40 @@ type policyConfig struct {
 }
 
 type nodeRecord struct {
-	ID                   string    `json:"id"`
-	Name                 string    `json:"name"`
-	ProxyURL             string    `json:"-"` // never serialize to API clients in clear form via dedicated DTO
-	ProxyURLStored       string    `json:"proxy_url"`
-	Enabled              bool      `json:"enabled"`
-	ProxyPool            bool      `json:"proxy_pool"`
-	AccountCapacity      int       `json:"account_capacity"`
-	Origin               string    `json:"origin,omitempty"`
-	ManagementMode       string    `json:"management_mode,omitempty"`
-	ExitIP               string    `json:"exit_ip,omitempty"`
-	ProbeStatus          string    `json:"probe_status,omitempty"`
-	ProbeLatencyMs       int64     `json:"probe_latency_ms,omitempty"`
-	AssignedAccountCount int       `json:"assigned_account_count"`
-	DisabledByGuard      bool      `json:"disabled_by_guard"`
-	QuarantinedUntil     float64   `json:"quarantined_until,omitempty"`
-	ErrorStrikes         int       `json:"error_strikes"`
-	SoftStrikes          int       `json:"soft_strikes"`
-	ThinkingStrikes      int       `json:"thinking_strikes"`
-	LastClassification   string    `json:"last_classification,omitempty"`
-	LastOutputTPS        float64   `json:"last_output_tps,omitempty"`
-	LastFirstTokenMs     int64     `json:"last_first_token_ms,omitempty"`
-	LastDurationMs       int64     `json:"last_duration_ms,omitempty"`
-	LastOutputTokens     int64     `json:"last_output_tokens,omitempty"`
-	LastReason           string    `json:"last_reason,omitempty"`
-	LastSource           string    `json:"last_source,omitempty"`
-	LastObservedAt       float64   `json:"last_observed_at,omitempty"`
-	LastProbeAt          float64   `json:"last_probe_at,omitempty"`
-	CreatedAt            time.Time `json:"created_at"`
-	UpdatedAt            time.Time `json:"updated_at"`
+	ID                   string  `json:"id"`
+	Name                 string  `json:"name"`
+	ProxyURL             string  `json:"-"` // never serialize to API clients in clear form via dedicated DTO
+	ProxyURLStored       string  `json:"proxy_url"`
+	Enabled              bool    `json:"enabled"`
+	ProxyPool            bool    `json:"proxy_pool"`
+	AccountCapacity      int     `json:"account_capacity"`
+	Origin               string  `json:"origin,omitempty"`
+	ManagementMode       string  `json:"management_mode,omitempty"`
+	ExitIP               string  `json:"exit_ip,omitempty"`
+	ProbeStatus          string  `json:"probe_status,omitempty"`
+	ProbeLatencyMs       int64   `json:"probe_latency_ms,omitempty"`
+	AssignedAccountCount int     `json:"assigned_account_count"`
+	DisabledByGuard      bool    `json:"disabled_by_guard"`
+	QuarantinedUntil     float64 `json:"quarantined_until,omitempty"`
+	// RecoveryFailCount is consecutive recovery probes that were still degraded.
+	// A healthy retest resets it. It does not count the original isolation.
+	RecoveryFailCount int `json:"recovery_fail_count,omitempty"`
+	// PermanentlyDegraded stops automatic recovery probes. The bound account stays disabled.
+	PermanentlyDegraded bool      `json:"permanently_degraded,omitempty"`
+	ErrorStrikes        int       `json:"error_strikes"`
+	SoftStrikes         int       `json:"soft_strikes"`
+	ThinkingStrikes     int       `json:"thinking_strikes"`
+	LastClassification  string    `json:"last_classification,omitempty"`
+	LastOutputTPS       float64   `json:"last_output_tps,omitempty"`
+	LastFirstTokenMs    int64     `json:"last_first_token_ms,omitempty"`
+	LastDurationMs      int64     `json:"last_duration_ms,omitempty"`
+	LastOutputTokens    int64     `json:"last_output_tokens,omitempty"`
+	LastReason          string    `json:"last_reason,omitempty"`
+	LastSource          string    `json:"last_source,omitempty"`
+	LastObservedAt      float64   `json:"last_observed_at,omitempty"`
+	LastProbeAt         float64   `json:"last_probe_at,omitempty"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
 }
 
 type nodeCreateInput struct {
@@ -145,6 +154,7 @@ type actionStats struct {
 	Quarantined int64 `json:"quarantined"`
 	Restored    int64 `json:"restored"`
 	Suppressed  int64 `json:"suppressed"`
+	Permanent   int64 `json:"permanently_degraded,omitempty"`
 }
 
 type statistics struct {
@@ -203,7 +213,8 @@ func defaultPolicy() policyConfig {
 		Mode:                       "hybrid",
 		ActiveIntervalSec:          1800,
 		PassivePollSec:             5,
-		QuarantineSec:              3600,
+		QuarantineSec:              1800,
+		MaxFailedRetests:           3,
 		SoftTPS:                    500,
 		HardTPS:                    1000,
 		ConsecutiveSoft:            2,
@@ -220,7 +231,7 @@ func defaultPolicy() policyConfig {
 		MigrateOnQuarantine:        false,
 		MaxOutputTokensProbe:       384,
 		ActiveProfileID:            defaultProbeProfileID(),
-		PolicySchema:               4,
+		PolicySchema:               5,
 	}
 }
 
@@ -244,6 +255,9 @@ func normalizePolicy(p *policyConfig, rawPolicy map[string]any) {
 	}
 	if p.QuarantineSec <= 0 {
 		p.QuarantineSec = def.QuarantineSec
+	}
+	if p.MaxFailedRetests <= 0 {
+		p.MaxFailedRetests = def.MaxFailedRetests
 	}
 	if p.SoftTPS <= 0 {
 		p.SoftTPS = def.SoftTPS
@@ -859,7 +873,13 @@ func (s *stateStore) updatePolicy(p policyConfig) error {
 		return fmt.Errorf("连续缺 thinking 次数需在 1 到 50 之间")
 	}
 	if p.QuarantineSec <= 0 {
-		p.QuarantineSec = 120
+		p.QuarantineSec = 1800
+	}
+	if p.MaxFailedRetests <= 0 {
+		p.MaxFailedRetests = 3
+	}
+	if p.MaxFailedRetests < 1 || p.MaxFailedRetests > 20 {
+		return fmt.Errorf("连续复测失败次数需在 1 到 20 之间")
 	}
 	if p.ActiveIntervalSec < 60 || p.ActiveIntervalSec > 86400 {
 		return fmt.Errorf("主动检测间隔需在 60 到 86400 秒之间")
@@ -954,7 +974,7 @@ func parseNodeListQuery(query url.Values) (nodeListQuery, error) {
 	}
 	out.State = strings.TrimSpace(query.Get("state"))
 	switch out.State {
-	case "", "quarantined", "disabled", "healthy":
+	case "", "quarantined", "disabled", "healthy", "permanent":
 	default:
 		return out, fmt.Errorf("state is invalid")
 	}
@@ -1043,6 +1063,10 @@ func (s *stateStore) listNodesPage(q nodeListQuery) nodeListPage {
 		switch q.State {
 		case "quarantined":
 			if !n.DisabledByGuard {
+				continue
+			}
+		case "permanent":
+			if !n.PermanentlyDegraded {
 				continue
 			}
 		case "disabled":
@@ -1343,6 +1367,8 @@ func (s *stateStore) updateNode(id string, mut func(*nodeRecord) error) (*nodeRe
 	n.UpdatedAt = time.Now().UTC()
 	critical := n.DisabledByGuard != before.DisabledByGuard ||
 		n.QuarantinedUntil != before.QuarantinedUntil ||
+		n.PermanentlyDegraded != before.PermanentlyDegraded ||
+		n.RecoveryFailCount != before.RecoveryFailCount ||
 		n.Enabled != before.Enabled ||
 		n.ProxyURL != before.ProxyURL
 	structural := n.Name != before.Name ||
@@ -1705,6 +1731,8 @@ func (s *stateStore) bumpAction(kind string) {
 		s.data.Stats.Actions.Restored++
 	case "suppressed":
 		s.data.Stats.Actions.Suppressed++
+	case "permanent":
+		s.data.Stats.Actions.Permanent++
 	}
 	s.scheduleFlushLocked()
 }
@@ -1749,6 +1777,8 @@ func publicNode(n *nodeRecord) map[string]any {
 		"assignedAccountCount": n.AssignedAccountCount,
 		"disabled_by_guard":    n.DisabledByGuard,
 		"quarantined_until":    n.QuarantinedUntil,
+		"recovery_fail_count":  n.RecoveryFailCount,
+		"permanently_degraded": n.PermanentlyDegraded,
 		"error_strikes":        n.ErrorStrikes,
 		"soft_strikes":         n.SoftStrikes,
 		"thinking_strikes":     n.ThinkingStrikes,

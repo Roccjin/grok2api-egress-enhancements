@@ -596,7 +596,7 @@ func probeQuality(store *stateStore, node *nodeRecord, profileID string) quality
 		res.ExitIP = ip
 	}
 
-	candidates, err := listAuthsForNode(node, 8)
+	candidates, err := listAuthsForQualityProbe(node, 8)
 	if err != nil || len(candidates) == 0 {
 		res.Classification = "error"
 		res.ErrorKind = "no_account"
@@ -915,6 +915,45 @@ func missingThinkingHit(res qualityResult, pol policyConfig) bool {
 		res.ErrorKind != "probe_unstable"
 }
 
+func maxFailedRetests(pol policyConfig) int {
+	if pol.MaxFailedRetests <= 0 {
+		return 3
+	}
+	return pol.MaxFailedRetests
+}
+
+func quarantineUntilUnix(pol policyConfig) float64 {
+	sec := pol.QuarantineSec
+	if sec <= 0 {
+		sec = 1800
+	}
+	return float64(time.Now().Add(time.Duration(sec) * time.Second).Unix())
+}
+
+// dueRecoveryProbe is true when an isolated node is past its wait and may be retested once.
+func dueRecoveryProbe(n *nodeRecord, now float64) bool {
+	if n == nil || !n.DisabledByGuard || n.PermanentlyDegraded {
+		return false
+	}
+	return n.QuarantinedUntil > 0 && now >= n.QuarantinedUntil
+}
+
+// claimRecoveryProbe pushes the next retry out by a few minutes so a slow probe
+// cannot be started again on the following worker tick.
+func claimRecoveryProbe(store *stateStore, id string) bool {
+	claimed := false
+	now := time.Now()
+	_, err := store.updateNode(id, func(n *nodeRecord) error {
+		if !dueRecoveryProbe(n, float64(now.Unix())) {
+			return nil
+		}
+		n.QuarantinedUntil = float64(now.Add(3 * time.Minute).Unix())
+		claimed = true
+		return nil
+	})
+	return err == nil && claimed
+}
+
 func applyObservation(store *stateStore, nodeID, source string, res qualityResult) {
 	pol := store.policy()
 	if res.Classification == "error" && res.ErrorKind != "transport_error" {
@@ -924,6 +963,8 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 	var (
 		doRestore     bool
 		doQuarantine  bool
+		doReisolate   bool
+		doPermanent   bool
 		quarantineWhy string
 		nodeCopy      nodeRecord
 		scheduleCV    bool
@@ -961,6 +1002,8 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 			if n.DisabledByGuard && (source == "active" || pol.Mode == "passive") {
 				n.DisabledByGuard = false
 				n.QuarantinedUntil = 0
+				n.RecoveryFailCount = 0
+				n.PermanentlyDegraded = false
 				doRestore = true
 			}
 
@@ -1034,6 +1077,36 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 				quarantineWhy = "连续探测错误: " + res.Error
 			}
 		}
+		// Already isolated: one active retest either restores, waits another interval,
+		// or counts a 降智 recovery. Do not probe again until that interval elapses.
+		// Only missing thinking counts toward permanent 降智. Slow TPS and transport
+		// failures postpone the next retest without burning that counter.
+		if n.DisabledByGuard && source == "active" && !doRestore && !n.PermanentlyDegraded {
+			if missingThinkingHit(res, pol) {
+				limit := maxFailedRetests(pol)
+				n.RecoveryFailCount++
+				if n.RecoveryFailCount >= limit {
+					n.PermanentlyDegraded = true
+					n.QuarantinedUntil = 0
+					why := res.Error
+					if why == "" {
+						why = "复测仍降智"
+					}
+					n.LastReason = fmt.Sprintf("连续 %d 次复测仍降智，已永久隔离：%s", n.RecoveryFailCount, why)
+					doPermanent = true
+				} else {
+					n.QuarantinedUntil = quarantineUntilUnix(pol)
+					why := res.Error
+					if why == "" {
+						why = "复测仍降智"
+					}
+					n.LastReason = fmt.Sprintf("复测仍降智（%d/%d），再次隔离：%s", n.RecoveryFailCount, limit, why)
+					doReisolate = true
+				}
+			} else {
+				n.QuarantinedUntil = quarantineUntilUnix(pol)
+			}
+		}
 		nodeCopy = *n
 		return nil
 	})
@@ -1084,6 +1157,8 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		// Account, quota, upstream and no-account failures are not evidence that
 		// the egress is degraded. Keep the observation for diagnostics, but never
 		// spend error strikes or quarantine the node for them.
+		// A recovery probe that could not be judged still waits a full interval
+		// (QuarantinedUntil already moved above) instead of retrying every tick.
 		store.bumpStat(source, "ignored", res.OutputTokens)
 		return
 	}
@@ -1106,6 +1181,35 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 	}
 	if doQuarantine {
 		quarantineNode(store, nodeCopy.ID, quarantineWhy, res.TPS, res.Classification)
+	}
+	if doPermanent {
+		store.bumpAction("permanent")
+		store.appendEvent(guardEvent{
+			Event:          "node_permanently_degraded",
+			NodeID:         nodeCopy.ID,
+			NodeName:       nodeCopy.Name,
+			Reason:         nodeCopy.LastReason,
+			Classification: res.Classification,
+			OutputTPS:      res.TPS,
+		})
+		nn := nodeCopy
+		if err := disableAuthsOnNode(store, &nn, "egress-guard 永久降智: "+nn.LastReason); err != nil {
+			store.appendEvent(guardEvent{Event: "accounts_disable_failed", NodeID: nn.ID, NodeName: nn.Name, Reason: err.Error()})
+		}
+	} else if doReisolate {
+		store.bumpAction("quarantined")
+		store.appendEvent(guardEvent{
+			Event:          "node_reisolated",
+			NodeID:         nodeCopy.ID,
+			NodeName:       nodeCopy.Name,
+			Reason:         nodeCopy.LastReason,
+			Classification: res.Classification,
+			OutputTPS:      res.TPS,
+		})
+		nn := nodeCopy
+		if err := disableAuthsOnNode(store, &nn, "egress-guard 降智隔离: "+nn.LastReason); err != nil {
+			store.appendEvent(guardEvent{Event: "accounts_disable_failed", NodeID: nn.ID, NodeName: nn.Name, Reason: err.Error()})
+		}
 	}
 	store.bumpStat(source, res.Classification, res.OutputTokens)
 }
@@ -1485,12 +1589,20 @@ func startGuardWorker(ctx context.Context, store *stateStore) {
 				tick++
 				pol := store.policy()
 				now := float64(time.Now().Unix())
+				ranRecovery := false
 				for _, n := range store.listNodes() {
-					if n.DisabledByGuard && n.QuarantinedUntil > 0 && now >= n.QuarantinedUntil {
-						_, _ = runNodeQuality(store, n.ID, "")
+					if !dueRecoveryProbe(n, now) {
 						continue
 					}
-					if pol.Mode == "active" || pol.Mode == "hybrid" {
+					if !claimRecoveryProbe(store, n.ID) {
+						continue
+					}
+					_, _ = runNodeQuality(store, n.ID, "")
+					ranRecovery = true
+					break
+				}
+				if !ranRecovery && (pol.Mode == "active" || pol.Mode == "hybrid") {
+					for _, n := range store.listNodes() {
 						if n.Enabled && !n.DisabledByGuard && (n.LastProbeAt == 0 || now-n.LastProbeAt >= float64(pol.ActiveIntervalSec)) {
 							_, _ = runNodeQuality(store, n.ID, "")
 							break

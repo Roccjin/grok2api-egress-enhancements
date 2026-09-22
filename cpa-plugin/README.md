@@ -8,7 +8,7 @@
 | | |
 |---|---|
 | 插件名 | `grok2api-egress` |
-| 当前版本 | **1.3.1** |
+| 当前版本 | **1.3.2** |
 | 语言 | Go (`-buildmode=c-shared` → `.so`) |
 | CPA SDK | `CLIProxyAPI/v7` (`pluginabi` / `pluginapi`) |
 | 能力 | Management UI + Usage Plugin + Scheduler + Request Interceptor |
@@ -115,10 +115,10 @@
 
 隔离时：
 
-1. 节点 `quarantined_until = now + quarantine_seconds`
+1. 节点 `quarantined_until = now + quarantine_seconds`（默认 1800 秒）
 2. 记事件 `node_quarantined`
-3. 同步摘除受影响账号，仅迁移到近期主动检测 healthy 且出口 IP 不同的节点（`accounts_migrated`）
-4. 到期后 probe 通过 → `node_restored`；可选换 IP Webhook 必须先确认新 IP 与旧 IP 不同
+3. 默认同步停用绑定账号且不改 `proxy_url`。仅在打开迁号时，才迁到近期主动检测 healthy 且出口 IP 不同的节点
+4. 到期后只做一次真实模型复测。健康则 `node_restored` 并清零失败次数；仍降智则再次隔离（`node_reisolated`）。连续 `max_failed_retests`（默认 3）次复测仍降智则 `node_permanently_degraded`，不再自动复测。传输失败只顺延间隔，不计入这 3 次
 
 保护项：
 

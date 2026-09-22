@@ -19,7 +19,7 @@ import (
 
 const (
 	pluginName          = "grok2api-egress"
-	pluginVersion       = "1.3.1"
+	pluginVersion       = "1.3.2"
 	resourcePath        = "/status"
 	managementAPIPath   = "/v0/management/grok2api-egress/api"
 	resourceContentType = "text/html; charset=utf-8"
@@ -395,6 +395,7 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			p.ActiveIntervalSec = intPick(raw, p.ActiveIntervalSec, "active_interval_seconds", "activeIntervalSeconds")
 			p.PassivePollSec = intPick(raw, p.PassivePollSec, "passive_poll_seconds", "passivePollSeconds")
 			p.QuarantineSec = intPick(raw, p.QuarantineSec, "quarantine_seconds", "quarantineSeconds")
+			p.MaxFailedRetests = intPick(raw, p.MaxFailedRetests, "max_failed_retests", "maxFailedRetests")
 			p.SoftTPS = floatPick(raw, p.SoftTPS, "soft_tps", "softTPS")
 			p.HardTPS = floatPick(raw, p.HardTPS, "hard_tps", "hardTPS")
 			p.ConsecutiveSoft = intPick(raw, p.ConsecutiveSoft, "consecutive_soft", "consecutiveSoft")
@@ -735,6 +736,13 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 				if mode != "" {
 					node.ManagementMode = mode
 				}
+				if clear, ok := boolPick(raw, "permanentlyDegraded", "permanently_degraded"); ok && !clear {
+					node.PermanentlyDegraded = false
+					node.RecoveryFailCount = 0
+					if node.DisabledByGuard {
+						node.QuarantinedUntil = float64(time.Now().Unix())
+					}
+				}
 				return nil
 			})
 			if err != nil {
@@ -836,20 +844,22 @@ func buildStatus() map[string]any {
 	nodeMap := map[string]any{}
 	for _, n := range nodes {
 		nodeMap[n.ID] = map[string]any{
-			"disabled_by_guard":   n.DisabledByGuard,
-			"quarantined_until":   n.QuarantinedUntil,
-			"error_strikes":       n.ErrorStrikes,
-			"soft_strikes":        n.SoftStrikes,
-			"thinking_strikes":    n.ThinkingStrikes,
-			"last_classification": n.LastClassification,
-			"last_output_tps":     n.LastOutputTPS,
-			"last_first_token_ms": n.LastFirstTokenMs,
-			"last_duration_ms":    n.LastDurationMs,
-			"last_output_tokens":  n.LastOutputTokens,
-			"last_reason":         n.LastReason,
-			"last_source":         n.LastSource,
-			"last_observed_at":    n.LastObservedAt,
-			"last_probe_at":       n.LastProbeAt,
+			"disabled_by_guard":    n.DisabledByGuard,
+			"quarantined_until":    n.QuarantinedUntil,
+			"recovery_fail_count":  n.RecoveryFailCount,
+			"permanently_degraded": n.PermanentlyDegraded,
+			"error_strikes":        n.ErrorStrikes,
+			"soft_strikes":         n.SoftStrikes,
+			"thinking_strikes":     n.ThinkingStrikes,
+			"last_classification":  n.LastClassification,
+			"last_output_tps":      n.LastOutputTPS,
+			"last_first_token_ms":  n.LastFirstTokenMs,
+			"last_duration_ms":     n.LastDurationMs,
+			"last_output_tokens":   n.LastOutputTokens,
+			"last_reason":          n.LastReason,
+			"last_source":          n.LastSource,
+			"last_observed_at":     n.LastObservedAt,
+			"last_probe_at":        n.LastProbeAt,
 		}
 	}
 	pol := store.policy()
@@ -1008,6 +1018,15 @@ func stringIDs(v any) []string {
 		out = append(out, t...)
 	}
 	return out
+}
+
+func boolPick(raw map[string]any, keys ...string) (bool, bool) {
+	for _, k := range keys {
+		if v, ok := raw[k].(bool); ok {
+			return v, true
+		}
+	}
+	return false, false
 }
 
 func intPick(raw map[string]any, def int, keys ...string) int {

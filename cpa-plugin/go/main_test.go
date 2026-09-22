@@ -191,11 +191,14 @@ func TestDefaultPolicyDefaults(t *testing.T) {
 	if pol.ConsecutiveMissingThinking != 1 {
 		t.Fatalf("default consecutive missing thinking=%d, want 1", pol.ConsecutiveMissingThinking)
 	}
-	if pol.QuarantineSec != 3600 {
-		t.Fatalf("default quarantine seconds=%d, want 3600", pol.QuarantineSec)
+	if pol.QuarantineSec != 1800 {
+		t.Fatalf("default quarantine seconds=%d, want 1800", pol.QuarantineSec)
 	}
-	if pol.PolicySchema != 4 {
-		t.Fatalf("default policy schema=%d, want 4", pol.PolicySchema)
+	if pol.MaxFailedRetests != 3 {
+		t.Fatalf("default max failed retests=%d, want 3", pol.MaxFailedRetests)
+	}
+	if pol.PolicySchema != 5 {
+		t.Fatalf("default policy schema=%d, want 5", pol.PolicySchema)
 	}
 	if got := classifyQuality(100, 64, false, pol); got != "hard" {
 		t.Fatalf("missing thinking with guard=%q, want hard", got)
@@ -224,11 +227,14 @@ func TestNormalizePolicyFillsAbsentBoolDefaults(t *testing.T) {
 	if p.ConsecutiveMissingThinking != 1 {
 		t.Fatalf("consecutive_missing_thinking=%d, want 1", p.ConsecutiveMissingThinking)
 	}
-	if p.PolicySchema != 4 {
-		t.Fatalf("policy_schema=%d, want 4", p.PolicySchema)
+	if p.PolicySchema != 5 {
+		t.Fatalf("policy_schema=%d, want 5", p.PolicySchema)
 	}
-	if p.QuarantineSec != 3600 {
-		t.Fatalf("migrated quarantine_seconds=%d, want 3600", p.QuarantineSec)
+	if p.QuarantineSec != 1800 {
+		t.Fatalf("migrated quarantine_seconds=%d, want 1800", p.QuarantineSec)
+	}
+	if p.MaxFailedRetests != 3 {
+		t.Fatalf("absent max_failed_retests=%d, want 3", p.MaxFailedRetests)
 	}
 
 	// Live leftover: schema 3 with both cross-verify flags still true.
@@ -248,8 +254,8 @@ func TestNormalizePolicyFillsAbsentBoolDefaults(t *testing.T) {
 	if pLive.QuarantineSec != 120 {
 		t.Fatalf("explicit quarantine 120s must stay, got %d", pLive.QuarantineSec)
 	}
-	if pLive.PolicySchema != 4 {
-		t.Fatalf("live leftover policy_schema=%d, want 4", pLive.PolicySchema)
+	if pLive.PolicySchema != 5 {
+		t.Fatalf("live leftover policy_schema=%d, want 5", pLive.PolicySchema)
 	}
 
 	// Operator-chosen quarantine interval must survive the schema bump.
@@ -640,7 +646,7 @@ func TestLoadMigratesSchemaAndRecordsEvent(t *testing.T) {
 	}
 	s := newStateStore(path)
 	pol := s.policy()
-	if pol.PolicySchema != 4 || !pol.ThinkingCrossVerify || !pol.SoftCrossVerify || pol.QuarantineSec != 120 {
+	if pol.PolicySchema != 5 || !pol.ThinkingCrossVerify || !pol.SoftCrossVerify || pol.QuarantineSec != 120 {
 		t.Fatalf("migrated policy must keep explicit flags and 120s quarantine, got %+v", pol)
 	}
 	found := false
@@ -1459,4 +1465,217 @@ func TestConfigureReusesWorkerWhenUnchanged(t *testing.T) {
 	if life.store != firstStore {
 		t.Fatal("reconfigure with same path must keep store")
 	}
+}
+
+func TestRecoveryRetestWaitsInsteadOfLooping(t *testing.T) {
+	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.createNode("n2", "http://127.0.0.1:7952", true, false, 10); err != nil {
+		t.Fatal(err)
+	}
+	pol := store.policy()
+	pol.ThinkingCrossVerify = false
+	pol.QuarantineSec = 1800
+	pol.MaxFailedRetests = 3
+	pol.MinHealthyNodes = 1
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	bad := qualityResult{Classification: "hard", HasThinking: false, OutputTokens: 64, TPS: 80, Error: "响应缺少 thinking_content（降智）"}
+	applyObservation(store, node.ID, "passive", bad)
+	got, _ := store.getNode(node.ID)
+	if !got.DisabledByGuard || got.RecoveryFailCount != 0 || got.PermanentlyDegraded {
+		t.Fatalf("initial isolation=%+v", got)
+	}
+	if _, err := store.updateNode(node.ID, func(n *nodeRecord) error {
+		n.QuarantinedUntil = float64(time.Now().Add(-time.Minute).Unix())
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	applyObservation(store, node.ID, "active", bad)
+	got, _ = store.getNode(node.ID)
+	if !got.DisabledByGuard || got.PermanentlyDegraded || got.RecoveryFailCount != 1 {
+		t.Fatalf("first failed retest=%+v", got)
+	}
+	if got.QuarantinedUntil < float64(time.Now().Add(1700*time.Second).Unix()) {
+		t.Fatalf("retest must push quarantine window, until=%v", got.QuarantinedUntil)
+	}
+	if dueRecoveryProbe(got, float64(time.Now().Unix())) {
+		t.Fatal("failed retest must not be due again immediately")
+	}
+	found := false
+	for _, ev := range store.events() {
+		if ev.Event == "node_reisolated" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected node_reisolated")
+	}
+}
+
+func TestRecoveryPermanentAfterThreeFailedRetests(t *testing.T) {
+	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.createNode("n2", "http://127.0.0.1:7952", true, false, 10); err != nil {
+		t.Fatal(err)
+	}
+	pol := store.policy()
+	pol.ThinkingCrossVerify = false
+	pol.MaxFailedRetests = 3
+	pol.MinHealthyNodes = 1
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	bad := qualityResult{Classification: "hard", HasThinking: false, OutputTokens: 64, TPS: 80, Error: "响应缺少 thinking_content（降智）"}
+	applyObservation(store, node.ID, "passive", bad)
+	for i := 1; i <= 3; i++ {
+		applyObservation(store, node.ID, "active", bad)
+	}
+	got, _ := store.getNode(node.ID)
+	if !got.PermanentlyDegraded || !got.DisabledByGuard || got.RecoveryFailCount != 3 || got.QuarantinedUntil != 0 {
+		t.Fatalf("permanent=%+v", got)
+	}
+	if dueRecoveryProbe(got, float64(time.Now().Add(24*time.Hour).Unix())) {
+		t.Fatal("permanent node must not be auto-retested")
+	}
+	applyObservation(store, node.ID, "active", bad)
+	got, _ = store.getNode(node.ID)
+	if got.RecoveryFailCount != 3 || !got.PermanentlyDegraded {
+		t.Fatalf("extra probe must not change permanent state: %+v", got)
+	}
+}
+
+func TestRecoveryHealthyClearsFailCount(t *testing.T) {
+	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.createNode("n2", "http://127.0.0.1:7952", true, false, 10); err != nil {
+		t.Fatal(err)
+	}
+	pol := store.policy()
+	pol.ThinkingCrossVerify = false
+	pol.MinHealthyNodes = 1
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	bad := qualityResult{Classification: "hard", HasThinking: false, OutputTokens: 64, TPS: 80, Error: "响应缺少 thinking_content（降智）"}
+	applyObservation(store, node.ID, "passive", bad)
+	applyObservation(store, node.ID, "active", bad)
+	applyObservation(store, node.ID, "active", qualityResult{Classification: "healthy", HasThinking: true, OutputTokens: 64, TPS: 20})
+	got, _ := store.getNode(node.ID)
+	if got.DisabledByGuard || got.PermanentlyDegraded || got.RecoveryFailCount != 0 || got.QuarantinedUntil != 0 {
+		t.Fatalf("healthy retest must restore: %+v", got)
+	}
+}
+
+func TestRecoveryTransportErrorDoesNotCount(t *testing.T) {
+	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.createNode("n2", "http://127.0.0.1:7952", true, false, 10); err != nil {
+		t.Fatal(err)
+	}
+	pol := store.policy()
+	pol.ThinkingCrossVerify = false
+	pol.QuarantineSec = 1800
+	pol.MinHealthyNodes = 1
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	bad := qualityResult{Classification: "hard", HasThinking: false, OutputTokens: 64, TPS: 80, Error: "响应缺少 thinking_content（降智）"}
+	applyObservation(store, node.ID, "passive", bad)
+	if _, err := store.updateNode(node.ID, func(n *nodeRecord) error {
+		n.QuarantinedUntil = float64(time.Now().Add(-time.Minute).Unix())
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	applyObservation(store, node.ID, "active", qualityResult{Classification: "error", ErrorKind: "transport_error", Error: "timeout"})
+	got, _ := store.getNode(node.ID)
+	if got.RecoveryFailCount != 0 || got.PermanentlyDegraded || !got.DisabledByGuard {
+		t.Fatalf("transport error must not count: %+v", got)
+	}
+	if got.QuarantinedUntil < float64(time.Now().Add(1700*time.Second).Unix()) {
+		t.Fatal("transport error must still postpone the next retest")
+	}
+}
+
+func TestQuarantineProbeUsesBoundDisabledAuthOnly(t *testing.T) {
+	node := &nodeRecord{ID: "7", ProxyURL: "http://127.0.0.1:7951", DisabledByGuard: true}
+	other := &nodeRecord{ID: "8", ProxyURL: "http://127.0.0.1:7952"}
+	auths := map[string]map[string]any{
+		"bound.json": {
+			"type": "xai", "email": "bound@example.test", "access_token": "bound-token",
+			"proxy_url": node.ProxyURL, "disabled": true, "disabled_reason": "egress-guard 降智隔离",
+		},
+		"foreign.json": {
+			"type": "xai", "email": "foreign@example.test", "access_token": "foreign-token",
+			"proxy_url": other.ProxyURL, "disabled": false,
+		},
+		"manual.json": {
+			"type": "xai", "email": "manual@example.test", "access_token": "manual-token",
+			"proxy_url": node.ProxyURL, "disabled": true, "disabled_reason": "operator maintenance",
+		},
+	}
+	original := hostCall
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			entries := make([]pluginapi.HostAuthFileEntry, 0, len(auths))
+			for name, raw := range auths {
+				disabled, _ := raw["disabled"].(bool)
+				entries = append(entries, pluginapi.HostAuthFileEntry{ID: name, AuthIndex: name, Name: name, Provider: "xai", Type: "xai", Disabled: disabled})
+			}
+			return json.Marshal(hostAuthListResponse{Files: entries})
+		case pluginabi.MethodHostAuthGet:
+			var request map[string]string
+			_ = json.Unmarshal(payload, &request)
+			name := request["auth_index"]
+			raw, ok := auths[name]
+			if !ok {
+				return nil, fmt.Errorf("missing %s", name)
+			}
+			body, _ := json.Marshal(raw)
+			return json.Marshal(hostAuthGetResponse{AuthIndex: name, Name: name, JSON: body})
+		default:
+			return nil, fmt.Errorf("unexpected %s", method)
+		}
+	}
+	t.Cleanup(func() { hostCall = original })
+
+	got, err := listAuthsForQualityProbe(node, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Name != "bound.json" {
+		t.Fatalf("quarantine probe auths=%v", namesOf(got))
+	}
+	open, err := listAuthsForNode(other, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) == 0 || open[0].Name != "foreign.json" {
+		t.Fatalf("healthy probe should still see its own auth, got %v", namesOf(open))
+	}
+}
+
+func namesOf(auths []authFile) []string {
+	out := make([]string, 0, len(auths))
+	for _, a := range auths {
+		out = append(out, a.Name)
+	}
+	return out
 }

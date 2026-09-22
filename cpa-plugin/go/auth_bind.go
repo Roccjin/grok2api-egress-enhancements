@@ -457,6 +457,66 @@ func pickAuthForNode(node *nodeRecord) (authFile, error) {
 	return list[0], nil
 }
 
+// listAuthsForQualityProbe picks the account used by an active quality probe.
+// A quarantined node must use its own bound account, including one the guard
+// already disabled. It must not borrow another node's token.
+func listAuthsForQualityProbe(node *nodeRecord, limit int) ([]authFile, error) {
+	if node != nil && node.DisabledByGuard {
+		return listBoundAuthsForProbe(node, limit)
+	}
+	return listAuthsForNode(node, limit)
+}
+
+// listBoundAuthsForProbe returns auths stuck to this proxy, including
+// guard-disabled ones, and never falls back to a foreign account.
+func listBoundAuthsForProbe(node *nodeRecord, limit int) ([]authFile, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	auths, err := listAuthFilesFresh()
+	if err != nil {
+		return nil, err
+	}
+	var primary, guardDisabled, expired []authFile
+	for _, a := range auths {
+		onNode := node != nil && node.ProxyURL != "" && a.ProxyURL == node.ProxyURL
+		if !onNode {
+			continue
+		}
+		tok, _ := a.Raw["access_token"].(string)
+		if strings.TrimSpace(tok) == "" {
+			continue
+		}
+		if a.Disabled {
+			if !isGuardDisabledAuth(a) {
+				continue
+			}
+			if isAuthExpired(a) {
+				expired = append(expired, a)
+			} else {
+				guardDisabled = append(guardDisabled, a)
+			}
+			continue
+		}
+		if isAuthExpired(a) {
+			expired = append(expired, a)
+			continue
+		}
+		primary = append(primary, a)
+	}
+	out := append(primary, guardDisabled...)
+	if len(out) == 0 {
+		out = append(out, expired...)
+	}
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("没有可用的 CPA xAI 账号")
+	}
+	return out, nil
+}
+
 // listAuthsForNode returns up to limit enabled xAI auths bound to the node proxy,
 // preferring non-expired tokens. Falls back to any enabled xAI auth if none bound.
 func listAuthsForNode(node *nodeRecord, limit int) ([]authFile, error) {

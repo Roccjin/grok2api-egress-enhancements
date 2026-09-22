@@ -72,6 +72,8 @@
     td { font-size: var(--text-xs); }
     tbody tr:last-child td { border-bottom: 0; }
     tbody tr:hover td { background: color-mix(in oklch, var(--secondary) 55%, transparent); }
+    tbody tr.row-permanent td { background: color-mix(in oklch, var(--destructive) 18%, var(--card)); }
+    tbody tr.row-permanent:hover td { background: color-mix(in oklch, var(--destructive) 26%, var(--card)); }
     tbody tr.row-quarantined td { background: var(--danger-surface); }
     tbody tr.row-quarantined:hover td { background: color-mix(in oklch, var(--danger-surface) 80%, var(--secondary)); }
     tbody tr.row-quarantined td.actions-col { background: var(--danger-surface); }
@@ -81,6 +83,7 @@
     tbody tr.row-disabled .node-name + .subtext { text-decoration: line-through; text-decoration-thickness: 1px; }
     tbody tr.row-disabled:hover td { background: color-mix(in oklch, var(--muted) 45%, transparent); }
     tbody tr.row-disabled td.actions-col { background: var(--card); }
+    .node-card.row-permanent { background: color-mix(in oklch, var(--destructive) 18%, var(--card)); border-color: color-mix(in oklch, var(--destructive) 45%, var(--border)); }
     .node-card.row-quarantined { background: var(--danger-surface); border-color: color-mix(in oklch, var(--destructive) 35%, var(--border)); }
     .node-card.row-disabled { opacity: 0.72; color: var(--muted-foreground); }
     .node-card.row-disabled strong { text-decoration: line-through; text-decoration-thickness: 1px; }
@@ -245,6 +248,7 @@
             <option value="">全部状态</option>
             <option value="healthy">正常</option>
             <option value="quarantined">已隔离</option>
+            <option value="permanent">永久降智</option>
             <option value="disabled">已停用</option>
           </select>
           <select id="node-sort" aria-label="排序">
@@ -379,7 +383,8 @@
           <div class="field"><label for="policy-mode">模式</label><select id="policy-mode"><option value="hybrid">混合</option><option value="passive">被动</option><option value="active">主动</option></select></div>
           <div class="field"><label for="policy-active">主动检测间隔（秒）</label><input id="policy-active" type="number" min="60" max="86400"></div>
           <div class="field"><label for="policy-passive">审计轮询间隔（秒）</label><input id="policy-passive" type="number" min="1" max="300"></div>
-          <div class="field"><label for="policy-quarantine">隔离复测间隔（秒）</label><input id="policy-quarantine" type="number" min="30" max="86400"></div>
+          <div class="field"><label for="policy-quarantine">隔离复测间隔（秒）</label><input id="policy-quarantine" type="number" min="30" max="86400"><p class="help">隔离后等这么久再复测一次。仍降智就再隔离一个间隔，不会连续重测。</p></div>
+          <div class="field"><label for="policy-max-failed-retests">连续复测失败上限</label><input id="policy-max-failed-retests" type="number" min="1" max="20"><p class="help">连续这么多次复测仍降智后永久隔离，不再自动复测。默认 3。</p></div>
           <div class="field"><label for="policy-min-healthy">最低健康节点数</label><input id="policy-min-healthy" type="number" min="1" max="1000"></div>
           <div class="field"><label for="policy-error-count">连续错误次数</label><input id="policy-error-count" type="number" min="1" max="20"></div>
           <div class="field"><label for="policy-model">主动探测模型</label><input id="policy-model" maxlength="120" autocomplete="off"></div>
@@ -645,6 +650,8 @@
       return {
         disabled_by_guard: node.disabled_by_guard,
         quarantined_until: node.quarantined_until,
+        recovery_fail_count: node.recovery_fail_count,
+        permanently_degraded: node.permanently_degraded,
         error_strikes: node.error_strikes,
         soft_strikes: node.soft_strikes,
         thinking_strikes: node.thinking_strikes,
@@ -663,6 +670,7 @@
     function nodeRank(node) {
       const guard = nodeGuard(node);
       if (!node.enabled) return 2; // 停用沉底
+      if (guard.permanently_degraded) return 1;
       if (guard.disabled_by_guard) return 1; // 隔离居中
       return 0; // 正常置顶
     }
@@ -680,6 +688,7 @@
       if (state.nodeFilterEnabled === 'true') list = list.filter((node) => node.enabled);
       if (state.nodeFilterEnabled === 'false') list = list.filter((node) => !node.enabled);
       if (state.nodeFilterState === 'quarantined') list = list.filter((node) => nodeGuard(node).disabled_by_guard);
+      if (state.nodeFilterState === 'permanent') list = list.filter((node) => nodeGuard(node).permanently_degraded);
       if (state.nodeFilterState === 'disabled') list = list.filter((node) => !node.enabled);
       if (state.nodeFilterState === 'healthy') list = list.filter((node) => node.enabled && !nodeGuard(node).disabled_by_guard);
       const sortMode = state.nodeSort || 'status';
@@ -713,10 +722,12 @@
     }
     function nodeRowClass(node, guard) {
       if (!node.enabled) return 'row-disabled';
+      if (guard.permanently_degraded) return 'row-permanent';
       if (guard.disabled_by_guard) return 'row-quarantined';
       return '';
     }
     function nodeBadge(node, guard) {
+      if (guard.permanently_degraded) return '<span class="badge bad">永久降智</span>';
       if (guard.disabled_by_guard) return '<span class="badge bad">已隔离</span>';
       if (!node.enabled) return '<span class="badge muted">已停用</span>';
       if (guard.error_strikes) return '<span class="badge warn">检测失败</span>';
@@ -725,6 +736,7 @@
       return '<span class="badge muted">待检测</span>';
     }
     function quarantineCountdown(guard) {
+      if (guard.permanently_degraded) return '不再自动复测';
       const until = Number(guard.quarantined_until || 0);
       if (!until || !guard.disabled_by_guard) return '';
       const left = Math.max(0, Math.round(until - Date.now() / 1000));
@@ -745,7 +757,11 @@
       return Math.ceil(left / 60) + ' 分钟后主动检测';
     }
     function actionButtons(node) {
-      return '<div class="row-actions">' +
+      const guard = nodeGuard(node);
+      const retry = guard.permanently_degraded
+        ? '<button class="button" type="button" data-action="retry-permanent" title="清除永久降智，下一轮到期后再复测一次">再给机会</button>'
+        : '';
+      return '<div class="row-actions">' + retry +
         '<button class="button" type="button" data-action="quality" title="真实模型质量检测">质量</button>' +
         '<button class="button" type="button" data-action="connectivity" title="检查代理连通性">连通</button>' +
         '<button class="button ghost" type="button" data-action="accounts" title="查看绑定账号">账号</button>' +
@@ -854,7 +870,7 @@
     function renderEvents() {
       const events = state.status?.recentEvents || [];
       if (!events.length) { $('events-list').innerHTML = '<div class="empty">暂无守护事件</div>'; return; }
-      const names = {node_quarantined:'节点已隔离',node_restored:'节点已恢复',quality_probe_completed:'质量检测完成',thinking_cross_verify_scheduled:'thinking 交叉验证已调度',soft_cross_verify_scheduled:'软阈值交叉验证已调度',node_rotated:'出口 IP 已轮换',node_rotation_failed:'换 IP 失败',quarantine_suppressed:'隔离已抑制',observe_skip_quarantine:'观察模式跳过隔离',accounts_migrated:'账号已迁移',accounts_migration_failed:'账号迁移失败',accounts_disabled:'账号已停用',accounts_disable_failed:'账号停用失败'};
+      const names = {node_quarantined:'节点已隔离',node_reisolated:'复测仍降智，再次隔离',node_permanently_degraded:'永久降智',node_restored:'节点已恢复',quality_probe_completed:'质量检测完成',thinking_cross_verify_scheduled:'thinking 交叉验证已调度',soft_cross_verify_scheduled:'软阈值交叉验证已调度',node_rotated:'出口 IP 已轮换',node_rotation_failed:'换 IP 失败',quarantine_suppressed:'隔离已抑制',observe_skip_quarantine:'观察模式跳过隔离',accounts_migrated:'账号已迁移',accounts_migration_failed:'账号迁移失败',accounts_disabled:'账号已停用',accounts_disable_failed:'账号停用失败'};
       $('events-list').innerHTML = events.slice().reverse().map((event) => '<div class="event"><div><strong>' + esc(names[event.event] || event.event || '守护事件') + ' · ' + esc(event.node_name || ('节点 ' + event.node_id)) + '</strong><small>' + esc(event.reason || event.classification || '-') + (event.output_tps ? ' · ' + Number(event.output_tps).toFixed(1) + ' Token/s' : '') + '</small></div><time>' + relative(event.ts) + '</time></div>').join('');
     }
     function renderPolicy() {
@@ -867,6 +883,7 @@
         ['主动间隔', cfg.active_interval_seconds + ' 秒'],
         ['被动轮询', cfg.passive_poll_seconds + ' 秒'],
         ['隔离复测', cfg.quarantine_seconds + ' 秒'],
+        ['连续失败上限', String(cfg.max_failed_retests || 3)],
         ['软 / 硬阈值', cfg.soft_tps + ' / ' + cfg.hard_tps],
         ['连续软/错', cfg.consecutive_soft + ' / ' + cfg.consecutive_errors],
         ['软阈值交叉验证', cfg.soft_cross_verify === true ? '开' : '关'],
@@ -908,7 +925,7 @@
       const cfg = state.status?.config;
       if (!cfg) return;
       $('policy-mode').value = cfg.mode; $('policy-active').value = cfg.active_interval_seconds; $('policy-passive').value = cfg.passive_poll_seconds;
-      $('policy-quarantine').value = cfg.quarantine_seconds; $('policy-soft').value = cfg.soft_tps; $('policy-hard').value = cfg.hard_tps;
+      $('policy-quarantine').value = cfg.quarantine_seconds; $('policy-max-failed-retests').value = cfg.max_failed_retests || 3; $('policy-soft').value = cfg.soft_tps; $('policy-hard').value = cfg.hard_tps;
       $('policy-soft-count').value = cfg.consecutive_soft; $('policy-error-count').value = cfg.consecutive_errors;
       $('policy-min-generation').value = cfg.min_generation_ms || 1000; $('policy-min-output').value = cfg.min_output_tokens || 32;
       $('policy-max-output').value = cfg.max_output_tokens || 384; $('policy-model').value = cfg.model || 'grok-4.5';
@@ -1046,6 +1063,9 @@
       } catch (error) {
         $('accounts-list').innerHTML = '<div class="error-state">' + esc(error.message) + '</div>';
       } finally { busy(button, false); }
+    }
+    async function retryPermanent(node, button) {
+      await mutate(button, () => api('/nodes/' + encodeURIComponent(node.id), {method:'PATCH', body:{permanentlyDegraded:false}}), node.name + ' 已重新进入隔离复测');
     }
     async function qualityTest(node, button) {
       busy(button, true);
@@ -1232,6 +1252,7 @@
       if (action === 'toggle') toggleNodes([node.id], !node.enabled, control);
       if (action === 'connectivity') testConnectivity([node.id], control);
       if (action === 'quality') qualityTest(node, control);
+      if (action === 'retry-permanent') confirmAction('再给一次复测', '将清除“' + node.name + '”的永久降智标记。账号保持停用，下一轮到期后再测一次；仍降智会重新计数。', (button) => retryPermanent(node, button));
       if (action === 'accounts') showAccounts(node, control);
       if (action === 'delete') confirmAction('删除节点', '将删除“' + node.name + '”。已绑定账号会失去该出口分配。', (button) => deleteNodes([node.id], button));
     }
@@ -1317,6 +1338,7 @@
         migrateOnQuarantine: $('policy-migrate-on-quarantine').checked,
         disableAuthOnHard: $('policy-disable-auth').checked,
         quarantineSeconds: Number($('policy-quarantine').value),
+        maxFailedRetests: Number($('policy-max-failed-retests').value) || 3,
         minHealthyNodes: Number($('policy-min-healthy').value),
         activeProfileId: $('policy-profile').value
       };
