@@ -1034,7 +1034,7 @@ func TestStoreCreateNodesIsAllOrNothing(t *testing.T) {
 
 func TestRenderStatusPage(t *testing.T) {
 	page := strings.Replace(pageTemplate, "/*__HALLMARK_TOKENS__*/", tokenCSS, 1)
-	for _, want := range []string{"出口守护", "纯 CPA", "data-batch=\"enable\"", "data-batch=\"manage\"", "重平衡账号", "从 Grok 凭证发现节点", "批量添加", "/nodes/import", "页面每 15 秒刷新", "最短生成窗口", "X-Grok2API-Egress-UI", "选择本页节点", "nodes-pager", "每页 50", "/quality-guard?view=summary", "隔离时迁号"} {
+	for _, want := range []string{"出口守护", "纯 CPA", "data-batch=\"enable\"", "data-batch=\"manage\"", "重平衡账号", "从 Grok 凭证发现节点", "批量添加", "/nodes/import", "页面每 15 秒刷新", "最短生成窗口", "X-Grok2API-Egress-UI", "选择本页节点", "nodes-pager", "每页 50", "/quality-guard?view=summary", "隔离时迁号", "enc::v2::", "cli-proxy-api-webui::secure-storage|v2|"} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("missing %q", want)
 		}

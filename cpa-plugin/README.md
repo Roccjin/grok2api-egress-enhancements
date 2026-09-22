@@ -8,7 +8,7 @@
 | | |
 |---|---|
 | 插件名 | `grok2api-egress` |
-| 当前版本 | **1.3.2** |
+| 当前版本 | **1.3.3** |
 | 语言 | Go (`-buildmode=c-shared` → `.so`) |
 | CPA SDK | `CLIProxyAPI/v7` (`pluginabi` / `pluginapi`) |
 | 能力 | Management UI + Usage Plugin + Scheduler + Request Interceptor |
@@ -138,6 +138,9 @@
 - 单条添加与逐行批量导入；保存后的代理 URL 不读取、不回显
 
 UI 经 management 代理，请求头需 `X-Grok2API-Egress-UI: 1`（页面已内置）。
+
+页面从同域 `localStorage` 读取管理密钥，兼容主面板的 `enc::v2::`（1.4.0 起）与历史 `enc::v1::` 混淆。
+两种前缀都解不开时视为未登录，直接提示重新登录，不会把密文当密钥发给 CPA。
 
 ---
 

@@ -505,14 +505,26 @@
       const decodeStoredValue = (storageKey) => {
         let raw = localStorage.getItem(storageKey) || '';
         if (!raw) return null;
-        if (raw.startsWith('enc::v1::')) {
-          const encoded = atob(raw.slice(9));
+        // 主面板从 1.4.0 起把 localStorage 混淆迁到 enc::v2::（密钥材料是主机名，不再绑 User-Agent）。
+        // 这里必须同时认 v2 与历史 v1，否则 v2 密文会被当成明文管理密钥发给 CPA。
+        const prefix = raw.startsWith('enc::v2::') ? 'enc::v2::' : (raw.startsWith('enc::v1::') ? 'enc::v1::' : '');
+        if (prefix) {
+          const encoded = atob(raw.slice(prefix.length));
           const value = Uint8Array.from(encoded, (char) => char.charCodeAt(0));
-          const key = new TextEncoder().encode('cli-proxy-api-webui::secure-storage|' + location.host + '|' + navigator.userAgent);
+          const material = prefix === 'enc::v2::'
+            ? 'cli-proxy-api-webui::secure-storage|v2|' + location.host
+            : 'cli-proxy-api-webui::secure-storage|' + location.host + '|' + navigator.userAgent;
+          const key = new TextEncoder().encode(material);
           for (let index = 0; index < value.length; index += 1) value[index] ^= key[index % key.length];
           raw = new TextDecoder().decode(value);
         }
-        try { return JSON.parse(raw); } catch (_) { return raw; }
+        try {
+          return JSON.parse(raw);
+        } catch (_) {
+          // 混淆值必然是可 JSON 解析的持久化结构。解不开就说明密钥材料不匹配，
+          // 绝不能把密文/乱码当管理密钥发出去，否则会连续失败并被 CPA 封 IP。
+          return prefix ? null : raw;
+        }
       };
       try {
         for (const storageKey of ['authToken', 'managementKey', 'cli-proxy-auth']) {
