@@ -152,13 +152,21 @@ func validateProbeProfile(p *ProbeProfile, creating bool) error {
 }
 
 func classifyWithProfile(res qualityResult, profile ProbeProfile, pol policyConfig) qualityResult {
+	if profile.ExpectedText != "" && !res.ExpectedMatched {
+		res.Classification = "hard"
+		res.Error = "响应缺少预期标记"
+		res.ErrorKind = reasonMarkerMissing
+		return res
+	}
+	// Visible reasoning text outranks a marker hit and a token-only usage block.
+	// A degraded account can still print QUALITY_OK while omitting reasoning_content.
+	if pol.ThinkingGuard && !res.HasThinking && res.OutputTokens > 0 && (pol.MinOutputTokens <= 0 || res.OutputTokens >= pol.MinOutputTokens) {
+		res.Classification = "hard"
+		res.Error = "响应缺少 thinking_content（降智）"
+		res.ErrorKind = "missing_thinking"
+		return res
+	}
 	if profile.ExpectedText != "" {
-		if !res.ExpectedMatched {
-			res.Classification = "hard"
-			res.Error = "响应缺少预期标记"
-			res.ErrorKind = reasonMarkerMissing
-			return res
-		}
 		// Marker hit is the primary signal. Only apply TPS when the sample
 		// is long enough to be a real throughput measurement.
 		if res.OutputTokens >= pol.MinOutputTokens && res.TPS > 0 {

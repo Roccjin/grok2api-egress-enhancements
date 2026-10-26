@@ -165,13 +165,46 @@ func mapHasThinkingContent(m map[string]any) bool {
 	return false
 }
 
-// recordHasThinking derives a thinking signal from a CPA usage event.
-// Prefer explicit thinking/reasoning body fields; fall back to reasoning_tokens > 0
-// because passive usage rarely includes full response text.
-func recordHasThinking(record map[string]any) bool {
+// thinkingObservation is what one usage event proves about visible reasoning text.
+// reasoning_tokens are not evidence: degraded xAI accounts spend more of them
+// while omitting reasoning_content entirely.
+type thinkingObservation int
+
+const (
+	thinkingUnknown thinkingObservation = iota
+	thinkingPresent
+	thinkingAbsent
+)
+
+// observeThinking reads an explicit host flag or response body.
+// A missing flag is unknown, not "no thinking" and not "has thinking".
+func observeThinking(record map[string]any) thinkingObservation {
 	if record == nil {
-		return false
+		return thinkingUnknown
 	}
+	if known, present := explicitReasoningVisible(record); known {
+		if present || bodyHasThinking(record) {
+			return thinkingPresent
+		}
+		return thinkingAbsent
+	}
+	if bodyHasThinking(record) {
+		return thinkingPresent
+	}
+	return thinkingUnknown
+}
+
+func explicitReasoningVisible(record map[string]any) (known bool, present bool) {
+	for _, key := range []string{"reasoning_visible", "ReasoningVisible", "reasoningVisible"} {
+		v, ok := record[key].(bool)
+		if ok {
+			return true, v
+		}
+	}
+	return false, false
+}
+
+func bodyHasThinking(record map[string]any) bool {
 	if mapHasThinkingContent(record) {
 		return true
 	}
@@ -180,7 +213,6 @@ func recordHasThinking(record map[string]any) bool {
 			return true
 		}
 	}
-	// Boolean / presence markers some hosts may attach.
 	for _, key := range []string{"has_thinking", "HasThinking", "hasThinking", "has_reasoning", "HasReasoning"} {
 		switch v := record[key].(type) {
 		case bool:
@@ -189,16 +221,6 @@ func recordHasThinking(record map[string]any) bool {
 			}
 		case string:
 			if strings.EqualFold(strings.TrimSpace(v), "true") || strings.TrimSpace(v) == "1" {
-				return true
-			}
-		}
-	}
-	if firstInt(record, "reasoning_tokens", "ReasoningTokens", "reasoningTokens") > 0 {
-		return true
-	}
-	for _, nestKey := range []string{"Detail", "detail", "Usage", "usage"} {
-		if nested, ok := record[nestKey].(map[string]any); ok {
-			if firstInt(nested, "reasoning_tokens", "ReasoningTokens", "reasoningTokens") > 0 {
 				return true
 			}
 		}
@@ -412,16 +434,27 @@ func rotateNodeIfConfigured(store *stateStore, node *nodeRecord) (bool, error) {
 	return true, nil
 }
 
+// grokCLIClientVersion is the identity sent by active quality probes.
+// cli-chat-proxy.grok.com rejects older clients with HTTP 426; the floor was
+// 1.0.13 as of 2026-10-01. Keep this aligned with CLIProxyAPI
+// xaiClientVersionValue (real traffic already sends that pin).
+const grokCLIClientVersion = "1.0.44"
+
 func applyGrokClientHeaders(req *http.Request, auth authFile) {
 	// Always force Grok CLI headers — missing X-XAI-Token-Auth yields
 	// upstream 401 "x_xai_token_auth=none / no auth context".
 	req.Header.Set("X-XAI-Token-Auth", "xai-grok-cli")
-	req.Header.Set("x-grok-client-version", "0.2.93")
 	req.Header.Set("x-grok-client-identifier", "grok-shell")
-	req.Header.Set("User-Agent", "CPA-egress-guard/1.0")
+	req.Header.Set("x-authenticateresponse", "authenticate-response")
 	if headers, ok := auth.Raw["headers"].(map[string]any); ok {
 		for k, v := range headers {
 			if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+				// Stored auth files used to pin x-grok-client-version=0.2.93.
+				// Copying that (or an old User-Agent) makes every probe 426.
+				switch strings.ToLower(strings.TrimSpace(k)) {
+				case "x-grok-client-version", "user-agent":
+					continue
+				}
 				req.Header.Set(k, s)
 			}
 		}
@@ -430,12 +463,11 @@ func applyGrokClientHeaders(req *http.Request, auth authFile) {
 	if req.Header.Get("X-XAI-Token-Auth") == "" {
 		req.Header.Set("X-XAI-Token-Auth", "xai-grok-cli")
 	}
-	if req.Header.Get("x-grok-client-version") == "" {
-		req.Header.Set("x-grok-client-version", "0.2.93")
-	}
 	if req.Header.Get("x-grok-client-identifier") == "" {
 		req.Header.Set("x-grok-client-identifier", "grok-shell")
 	}
+	req.Header.Set("x-grok-client-version", grokCLIClientVersion)
+	req.Header.Set("User-Agent", "xai-grok-workspace/"+grokCLIClientVersion)
 }
 
 func isAuthExpired(auth authFile) bool {
@@ -734,9 +766,6 @@ func probeQuality(store *stateStore, node *nodeRecord, profileID string) quality
 			if u, ok := chunk["usage"].(map[string]any); ok {
 				usageOut = maxInt64(usageOut, outputTokensFromUsage(u))
 				usageReason = maxInt64(usageReason, anyInt(u["reasoning_tokens"]), anyInt(u["reasoningTokens"]))
-				if usageReason > 0 {
-					hasThinking = true
-				}
 			}
 			choices, _ := chunk["choices"].([]any)
 			for _, c := range choices {
@@ -1474,8 +1503,23 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 		}
 	} else {
 		tps = computeTPS(outTokens, durMs, ttftMs, pol.MinGenerationMs)
-		hasThinking = recordHasThinking(record)
-		class = classifyQuality(tps, outTokens, hasThinking, pol)
+		switch observeThinking(record) {
+		case thinkingPresent:
+			hasThinking = true
+			class = classifyQuality(tps, outTokens, true, pol)
+		case thinkingAbsent:
+			// Enough client output with an explicit "no reasoning text" scan is
+			// 降智 even when duration was not parsed into TPS.
+			if pol.ThinkingGuard && outTokens > 0 && (pol.MinOutputTokens <= 0 || outTokens >= pol.MinOutputTokens) {
+				class = "hard"
+			} else {
+				class = classifyQuality(tps, outTokens, false, pol)
+			}
+		default:
+			// No body and no host flag. Do not treat reasoning_tokens as thinking,
+			// and do not quarantine the whole pool on an uninstrumented host.
+			class = "unknown"
+		}
 	}
 
 	// On anomaly, force auth-proxy cache refresh so we don't miss mappings.

@@ -15,6 +15,34 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
+func TestProbeClientVersionIgnoresStaleAuthPin(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://cli-chat-proxy.grok.com/v1/chat/completions", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyGrokClientHeaders(req, authFile{Raw: map[string]any{
+		"headers": map[string]any{
+			"x-grok-client-version":    "0.2.93",
+			"User-Agent":               "xai-grok-workspace/0.2.93",
+			"x-grok-client-identifier": "grok-shell",
+			"X-XAI-Token-Auth":         "xai-grok-cli",
+		},
+	}})
+	if got := req.Header.Get("x-grok-client-version"); got != grokCLIClientVersion {
+		t.Fatalf("x-grok-client-version=%q, want %q", got, grokCLIClientVersion)
+	}
+	wantUA := "xai-grok-workspace/" + grokCLIClientVersion
+	if got := req.Header.Get("User-Agent"); got != wantUA {
+		t.Fatalf("User-Agent=%q, want %q", got, wantUA)
+	}
+	if got := req.Header.Get("x-grok-client-identifier"); got != "grok-shell" {
+		t.Fatalf("identifier=%q", got)
+	}
+	if got := req.Header.Get("X-XAI-Token-Auth"); got != "xai-grok-cli" {
+		t.Fatalf("token auth=%q", got)
+	}
+}
+
 func TestComputeTPSUsesGenerationWindow(t *testing.T) {
 	// 1050 tokens over 500ms generation window (1100-600) => 2100 TPS
 	if got := computeTPS(1050, 1100, 600, 200); got < 2099 || got > 2101 {
@@ -94,21 +122,46 @@ func TestThinkingGuardOffFallsBackToTPSOnly(t *testing.T) {
 	}
 }
 
-func TestRecordHasThinkingFallsBackToReasoningTokens(t *testing.T) {
-	if recordHasThinking(map[string]any{
-		"Detail": map[string]any{"reasoning_tokens": float64(12)},
-	}) != true {
-		t.Fatal("reasoning_tokens in Detail should count as thinking")
+func TestObserveThinkingIgnoresReasoningTokens(t *testing.T) {
+	if observeThinking(map[string]any{
+		"Detail": map[string]any{"ReasoningTokens": float64(867)},
+	}) != thinkingUnknown {
+		t.Fatal("reasoning_tokens without a visibility flag must stay unknown")
 	}
-	if recordHasThinking(map[string]any{
+	if observeThinking(map[string]any{
+		"reasoning_visible": false,
+		"Detail":            map[string]any{"ReasoningTokens": float64(867)},
+	}) != thinkingAbsent {
+		t.Fatal("explicit reasoning_visible=false is absent even when tokens are high")
+	}
+	if observeThinking(map[string]any{
+		"reasoning_visible": true,
+	}) != thinkingPresent {
+		t.Fatal("explicit reasoning_visible=true is present")
+	}
+	if observeThinking(map[string]any{
 		"delta": map[string]any{"thinking_content": "step 1"},
-	}) != true {
+	}) != thinkingPresent {
 		t.Fatal("thinking_content should count as thinking")
 	}
-	if recordHasThinking(map[string]any{
+	if observeThinking(map[string]any{
 		"output_tokens": float64(64),
-	}) != false {
-		t.Fatal("plain output without reasoning must not count as thinking")
+	}) != thinkingUnknown {
+		t.Fatal("plain output without a flag must stay unknown, not absent")
+	}
+}
+
+func TestMarkerHitWithoutThinkingIsDegraded(t *testing.T) {
+	pol := defaultPolicy()
+	profile := ProbeProfile{ID: profileQualityMarker, ExpectedText: "QUALITY_OK", MatchMode: matchLastLine}
+	got := classifyWithProfile(qualityResult{
+		TPS:             10,
+		OutputTokens:    pol.MinOutputTokens,
+		ExpectedMatched: true,
+		HasThinking:     false,
+	}, profile, pol)
+	if got.Classification != "hard" || got.ErrorKind != "missing_thinking" {
+		t.Fatalf("marker hit without thinking = %+v", got)
 	}
 }
 
