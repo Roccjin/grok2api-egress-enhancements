@@ -182,7 +182,9 @@ def to_cpa_auth(acc: dict, proxy_url: str) -> dict:
         "disabled": False,
         "headers": {
             "X-XAI-Token-Auth": "xai-grok-cli",
-            "x-grok-client-version": "0.2.93",
+            # Do not pin x-grok-client-version here. CPA applies it after custom
+            # headers, so a stale value (0.2.93) overrides the binary pin and
+            # cli-chat-proxy answers HTTP 426.
             "x-grok-client-identifier": "grok-shell",
         },
         "_imported_from": "g2a-one-shot",
