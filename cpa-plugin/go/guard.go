@@ -623,11 +623,6 @@ func probeQuality(store *stateStore, node *nodeRecord, profileID string) quality
 		return res
 	}
 
-	// connectivity first for exit IP
-	if ip, _, errIP := probeConnectivity(node.ProxyURL); errIP == nil {
-		res.ExitIP = ip
-	}
-
 	candidates, err := listAuthsForQualityProbe(node, 8)
 	if err != nil || len(candidates) == 0 {
 		res.Classification = "error"
@@ -638,6 +633,12 @@ func probeQuality(store *stateStore, node *nodeRecord, profileID string) quality
 			res.Error = "没有可用的 CPA xAI 账号"
 		}
 		return res
+	}
+
+	// Dial only after a credential is bound. An unbound node has nothing to test,
+	// and opening the proxy on every recovery tick just fills the event list.
+	if ip, _, errIP := probeConnectivity(node.ProxyURL); errIP == nil {
+		res.ExitIP = ip
 	}
 
 	client, err := httpClientThroughProxy(node.ProxyURL, 90*time.Second)
@@ -959,6 +960,13 @@ func quarantineUntilUnix(pol policyConfig) float64 {
 	return float64(time.Now().Add(time.Duration(sec) * time.Second).Unix())
 }
 
+// noAccountProbeBackoff is how long an isolated node waits after a probe that
+// found no sticky credential. The short quarantine interval would otherwise
+// repeat "没有可用的 CPA xAI 账号" on every tick.
+const noAccountProbeBackoff = 6 * time.Hour
+
+const noAccountPauseReason = "没有可用的 CPA xAI 账号，暂停复测"
+
 // dueRecoveryProbe is true when an isolated node is past its wait and may be retested once.
 func dueRecoveryProbe(n *nodeRecord, now float64) bool {
 	if n == nil || !n.DisabledByGuard || n.PermanentlyDegraded {
@@ -1132,6 +1140,9 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 					n.LastReason = fmt.Sprintf("复测仍降智（%d/%d），再次隔离：%s", n.RecoveryFailCount, limit, why)
 					doReisolate = true
 				}
+			} else if res.ErrorKind == "no_account" {
+				n.QuarantinedUntil = float64(time.Now().Add(noAccountProbeBackoff).Unix())
+				n.LastReason = noAccountPauseReason
 			} else {
 				n.QuarantinedUntil = quarantineUntilUnix(pol)
 			}
@@ -1392,10 +1403,22 @@ func runNodeQuality(store *stateStore, id, profileID string) (map[string]any, er
 	if res.Classification == "error" && res.ErrorKind != "transport_error" {
 		res.Classification = "ignored"
 	}
-	applyObservation(store, id, "active", res)
 	reason := res.Error
+	if res.ErrorKind == "no_account" {
+		reason = noAccountPauseReason
+	}
 	if reason == "" && res.ErrorKind == reasonMarkerMissing {
 		reason = "响应缺少预期标记"
+	}
+	repeatNoAccount := res.ErrorKind == "no_account" && n.LastReason == noAccountPauseReason
+	applyObservation(store, id, "active", res)
+	if repeatNoAccount {
+		return map[string]any{
+			"id":             id,
+			"classification": "ignored",
+			"error":          noAccountPauseReason,
+			"errorKind":      "no_account",
+		}, nil
 	}
 	store.appendEvent(guardEvent{
 		Event:          "quality_probe_completed",

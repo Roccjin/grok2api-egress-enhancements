@@ -410,6 +410,7 @@
             <div class="form-grid">
               <div class="field full check-row"><div><label for="policy-thinking-guard">启用 thinking 降智判定</label><p class="help">开启后：同一出口连续缺少 thinking_content 达到设定次数则隔离；有 thinking 时回落 Token/s 阈值</p></div><input id="policy-thinking-guard" type="checkbox"></div>
               <div class="field" id="policy-missing-count-wrap"><label for="policy-missing-thinking-count">连续缺 thinking 次数</label><input id="policy-missing-thinking-count" type="number" min="1" max="50"><p class="help">同一出口连续多少次无 thinking 才动作；默认 1</p></div>
+              <div class="field" id="policy-thinking-retry-wrap"><label for="policy-thinking-retry">本轮换号次数</label><input id="policy-thinking-retry" type="number" min="0" max="8"><p class="help">正文已到仍没有思考时，取消这次生成并换号。用满次数后放行最后一次正文。0 只隔离、不换号。默认 3。健康节点不足时本次不换号。</p></div>
               <div class="field full check-row" id="policy-thinking-cv-wrap"><div><label for="policy-thinking-cross-verify">thinking 交叉验证探测</label><p class="help">与主动的质量探测进行交叉验证，达到连续缺 thinking 次数后不立即隔离，先做一次主动质量探测；复测仍无 thinking 才判定降智。</p></div><input id="policy-thinking-cross-verify" type="checkbox"></div>
             </div>
           </section>
@@ -900,6 +901,7 @@
         ['连续软/错', cfg.consecutive_soft + ' / ' + cfg.consecutive_errors],
         ['软阈值交叉验证', cfg.soft_cross_verify === true ? '开' : '关'],
         ['thinking 降智', thinkingOn ? '开' : '关'],
+        ['本轮换号次数', thinkingOn ? String(cfg.thinking_retry != null ? cfg.thinking_retry : 3) : '-'],
         ['连续缺 thinking', thinkingOn ? String(cfg.consecutive_missing_thinking || 1) : '-'],
         ['thinking 交叉验证', thinkingOn && cfg.thinking_cross_verify === true ? '开' : '关'],
         ['最短生成窗口', (cfg.min_generation_ms || 1000) + ' ms'],
@@ -943,6 +945,7 @@
       $('policy-max-output').value = cfg.max_output_tokens || 384; $('policy-model').value = cfg.model || 'grok-4.5';
       $('policy-min-healthy').value = cfg.min_healthy_nodes;
       $('policy-thinking-guard').checked = cfg.thinking_guard !== false;
+      $('policy-thinking-retry').value = cfg.thinking_retry != null ? cfg.thinking_retry : 3;
       $('policy-missing-thinking-count').value = cfg.consecutive_missing_thinking || 1;
       $('policy-thinking-cross-verify').checked = cfg.thinking_guard !== false && cfg.thinking_cross_verify === true;
       $('policy-soft-cross-verify').checked = cfg.soft_cross_verify === true;
@@ -1314,6 +1317,7 @@
       const on = $('policy-thinking-guard').checked;
       $('policy-thinking-cross-verify').disabled = !on;
       $('policy-missing-thinking-count').disabled = !on;
+      $('policy-thinking-retry').disabled = !on;
       const section = $('policy-section-thinking');
       if (section) section.classList.toggle('is-disabled', !on);
       if (!on) {
@@ -1345,6 +1349,7 @@
         model: $('policy-model').value.trim(),
         thinkingGuard: thinkingOn,
         consecutiveMissingThinking: Number($('policy-missing-thinking-count').value) || 1,
+        thinkingRetry: (() => { const n = Number($('policy-thinking-retry').value); return Number.isFinite(n) ? Math.max(0, Math.min(8, n)) : 0; })(),
         thinkingCrossVerify: thinkingOn && $('policy-thinking-cross-verify').checked,
         softCrossVerify: $('policy-soft-cross-verify').checked,
         migrateOnQuarantine: $('policy-migrate-on-quarantine').checked,

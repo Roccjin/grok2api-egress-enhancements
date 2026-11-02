@@ -232,6 +232,9 @@ func TestDefaultPolicyDefaults(t *testing.T) {
 	if !pol.ThinkingGuard {
 		t.Fatal("default ThinkingGuard should be on")
 	}
+	if pol.ThinkingRetry != 3 {
+		t.Fatalf("default ThinkingRetry=%d", pol.ThinkingRetry)
+	}
 	if pol.ThinkingCrossVerify {
 		t.Fatal("default ThinkingCrossVerify should be off")
 	}
@@ -881,6 +884,49 @@ func TestRequestInterceptorRejectsQuarantinedAuth(t *testing.T) {
 	_ = json.Unmarshal(env.Result, &response)
 	if !response.Terminate || response.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("interceptor response=%+v", response)
+	}
+}
+
+func TestRequestInterceptorAttachesThinkingRetry(t *testing.T) {
+	dir := t.TempDir()
+	store = newStateStore(filepath.Join(dir, "state.json"))
+	if _, err := store.createNode("good", "http://127.0.0.1:7951", true, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	rawRequest, _ := json.Marshal(pluginapi.RequestInterceptRequest{Metadata: map[string]any{"selected_auth_id": "auth-good"}})
+	raw, err := handleRequestIntercept(rawRequest, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil || !env.OK {
+		t.Fatalf("envelope=%s err=%v", raw, err)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(env.Result, &response); err != nil {
+		t.Fatal(err)
+	}
+	meta, _ := response["Metadata"].(map[string]any)
+	if meta == nil {
+		t.Fatalf("missing metadata: %s", env.Result)
+	}
+	if got := int(meta["egress_thinking_retry"].(float64)); got != 3 {
+		t.Fatalf("retry=%v", meta["egress_thinking_retry"])
+	}
+	pol := store.policy()
+	pol.MinHealthyNodes = 2
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = handleRequestIntercept(rawRequest, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = json.Unmarshal(raw, &env)
+	_ = json.Unmarshal(env.Result, &response)
+	meta, _ = response["Metadata"].(map[string]any)
+	if got := int(meta["egress_thinking_retry"].(float64)); got != 0 {
+		t.Fatalf("suppressed retry=%v", meta["egress_thinking_retry"])
 	}
 }
 
@@ -1663,6 +1709,40 @@ func TestRecoveryTransportErrorDoesNotCount(t *testing.T) {
 	}
 	if got.QuarantinedUntil < float64(time.Now().Add(1700*time.Second).Unix()) {
 		t.Fatal("transport error must still postpone the next retest")
+	}
+}
+
+func TestNoAccountRecoveryPausesUntilBound(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("empty", "http://127.0.0.1:7951", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(node.ID, func(n *nodeRecord) error {
+		n.DisabledByGuard = true
+		n.QuarantinedUntil = float64(time.Now().Add(-time.Minute).Unix())
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	applyObservation(store, node.ID, "active", qualityResult{
+		Classification: "error",
+		ErrorKind:      "no_account",
+		Error:          "没有可用的 CPA xAI 账号",
+	})
+	got, _ := store.getNode(node.ID)
+	if !got.DisabledByGuard || got.RecoveryFailCount != 0 {
+		t.Fatalf("no account must not count as a failed retest: %+v", got)
+	}
+	if got.LastReason != noAccountPauseReason {
+		t.Fatalf("reason=%q", got.LastReason)
+	}
+	if got.QuarantinedUntil < float64(time.Now().Add(5*time.Hour).Unix()) {
+		t.Fatal("no-account probe must wait hours, not the short quarantine interval")
+	}
+	noteAssignedCount(got, 1, float64(time.Now().Unix()))
+	if got.AssignedAccountCount != 1 || got.QuarantinedUntil > float64(time.Now().Unix()) {
+		t.Fatalf("binding a credential must make the node due: %+v", got)
 	}
 }
 

@@ -19,7 +19,7 @@ import (
 
 const (
 	pluginName          = "grok2api-egress"
-	pluginVersion       = "1.3.5"
+	pluginVersion       = "1.3.7"
 	resourcePath        = "/status"
 	managementAPIPath   = "/v0/management/grok2api-egress/api"
 	resourceContentType = "text/html; charset=utf-8"
@@ -418,6 +418,12 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			}
 			if v, ok := raw["thinkingGuard"].(bool); ok {
 				p.ThinkingGuard = v
+			}
+			if _, ok := raw["thinking_retry"]; ok {
+				p.ThinkingRetry = intPick(raw, p.ThinkingRetry, "thinking_retry", "thinkingRetry")
+			}
+			if _, ok := raw["thinkingRetry"]; ok {
+				p.ThinkingRetry = intPick(raw, p.ThinkingRetry, "thinking_retry", "thinkingRetry")
 			}
 			p.ConsecutiveMissingThinking = intPick(raw, p.ConsecutiveMissingThinking, "consecutive_missing_thinking", "consecutiveMissingThinking")
 			if v, ok := raw["thinking_cross_verify"].(bool); ok {

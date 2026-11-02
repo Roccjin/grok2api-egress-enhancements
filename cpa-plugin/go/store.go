@@ -58,6 +58,10 @@ type policyConfig struct {
 	// classification falls back to the original soft/hard Token/s thresholds only.
 	// Absent in old state.json → default true (see normalizePolicy).
 	ThinkingGuard bool `json:"thinking_guard"`
+	// ThinkingRetry is how many credentials one request may try before the last
+	// body is released. 0 disables the in-request switch and only isolates.
+	// This counter is not CPA's request-retry.
+	ThinkingRetry int `json:"thinking_retry"`
 	// ConsecutiveMissingThinking is how many consecutive missing-thinking samples
 	// on the same egress are required before isolation / cross-verify. Default 1.
 	ConsecutiveMissingThinking int `json:"consecutive_missing_thinking"`
@@ -225,6 +229,7 @@ func defaultPolicy() policyConfig {
 		Model:                      "grok-4.5",
 		DisableAuthOnHard:          true,
 		ThinkingGuard:              true,
+		ThinkingRetry:              3,
 		ConsecutiveMissingThinking: 1,
 		ThinkingCrossVerify:        false,
 		SoftCrossVerify:            false,
@@ -307,6 +312,15 @@ func normalizePolicy(p *policyConfig, rawPolicy map[string]any) {
 	}
 	if !has("thinking_guard", "thinkingGuard") {
 		p.ThinkingGuard = def.ThinkingGuard
+	}
+	if !has("thinking_retry", "thinkingRetry") {
+		p.ThinkingRetry = def.ThinkingRetry
+	}
+	if p.ThinkingRetry < 0 {
+		p.ThinkingRetry = 0
+	}
+	if p.ThinkingRetry > 8 {
+		p.ThinkingRetry = 8
 	}
 	if !has("disable_auth_on_hard", "disableAuthOnHard") {
 		p.DisableAuthOnHard = def.DisableAuthOnHard
@@ -904,6 +918,12 @@ func (s *stateStore) updatePolicy(p policyConfig) error {
 	}
 	if !p.ThinkingGuard {
 		p.ThinkingCrossVerify = false
+	}
+	if p.ThinkingRetry < 0 {
+		p.ThinkingRetry = 0
+	}
+	if p.ThinkingRetry > 8 {
+		p.ThinkingRetry = 8
 	}
 	if strings.TrimSpace(p.ActiveProfileID) == "" {
 		p.ActiveProfileID = defaultProbeProfileID()
@@ -1740,10 +1760,25 @@ func (s *stateStore) bumpAction(kind string) {
 func (s *stateStore) setAssignedCounts(counts map[string]int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := float64(time.Now().Unix())
 	for id, n := range s.data.Nodes {
-		n.AssignedAccountCount = counts[id]
+		noteAssignedCount(n, counts[id], now)
 	}
 	s.scheduleFlushLocked()
+}
+
+// noteAssignedCount records how many auth files share this node's proxy.
+// A node paused for lack of a credential is due for one retest as soon as
+// a file is bound to it.
+func noteAssignedCount(n *nodeRecord, count int, now float64) {
+	if n == nil {
+		return
+	}
+	prev := n.AssignedAccountCount
+	n.AssignedAccountCount = count
+	if prev == 0 && count > 0 && n.DisabledByGuard && strings.Contains(n.LastReason, "没有可用的 CPA xAI 账号") && n.QuarantinedUntil > now {
+		n.QuarantinedUntil = now
+	}
 }
 
 // nodeIDByProxy returns the node id bound to proxyURL (O(nodes), typically small).
