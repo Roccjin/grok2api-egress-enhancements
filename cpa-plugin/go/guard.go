@@ -249,6 +249,47 @@ func classifyQuality(tps float64, outputTokens int64, hasThinking bool, pol poli
 	return classifyTPS(tps, pol.SoftTPS, pol.HardTPS)
 }
 
+// classifyPassiveQuality applies the output floor only to plain prose. A reply
+// that carries a tool call is short by construction, so a missing reasoning
+// signal is full evidence of degradation rather than a thin sample.
+func classifyPassiveQuality(tps float64, outputTokens int64, hasThinking bool, toolCalls int64, pol policyConfig) string {
+	if pol.ThinkingGuard && !hasThinking && toolCalls > 0 && outputTokens > 0 {
+		return "hard"
+	}
+	return classifyQuality(tps, outputTokens, hasThinking, pol)
+}
+
+// toolCallsFromRecord reports how many client tool calls the response asked
+// for. The host mirrors the upstream counter into Detail.ToolCallsRequested;
+// the nested tool_usage_details form is accepted for raw records.
+func toolCallsFromRecord(record map[string]any) int64 {
+	if record == nil {
+		return 0
+	}
+	for _, key := range []string{"tool_usage_details", "ToolUsageDetails"} {
+		if details, ok := record[key].(map[string]any); ok {
+			if n := firstInt(details, "tool_calls_requested", "ToolCallsRequested", "toolCallsRequested"); n > 0 {
+				return n
+			}
+		}
+	}
+	for _, key := range []string{"Detail", "detail"} {
+		detail, ok := record[key].(map[string]any)
+		if !ok {
+			continue
+		}
+		if n := firstInt(detail, "ToolCallsRequested", "tool_calls_requested", "toolCallsRequested"); n > 0 {
+			return n
+		}
+		if details, ok := detail["ToolUsageDetails"].(map[string]any); ok {
+			if n := firstInt(details, "ToolCallsRequested", "tool_calls_requested"); n > 0 {
+				return n
+			}
+		}
+	}
+	return firstInt(record, "tool_calls_requested", "ToolCallsRequested")
+}
+
 func classifyFailureKind(status int, body string) string {
 	lower := strings.ToLower(body)
 	if status == http.StatusProxyAuthRequired {
@@ -1532,12 +1573,9 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 			class = classifyQuality(tps, outTokens, true, pol)
 		case thinkingAbsent:
 			// Enough client output with an explicit "no reasoning text" scan is
-			// 降智 even when duration was not parsed into TPS.
-			if pol.ThinkingGuard && outTokens > 0 && (pol.MinOutputTokens <= 0 || outTokens >= pol.MinOutputTokens) {
-				class = "hard"
-			} else {
-				class = classifyQuality(tps, outTokens, false, pol)
-			}
+			// 降智 even when duration was not parsed into TPS. A bare tool call
+			// is short by design, so it bypasses the output floor.
+			class = classifyPassiveQuality(tps, outTokens, false, toolCallsFromRecord(record), pol)
 		default:
 			// No body and no host flag. Do not treat reasoning_tokens as thinking,
 			// and do not quarantine the whole pool on an uninstrumented host.

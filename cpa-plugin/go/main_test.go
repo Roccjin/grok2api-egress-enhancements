@@ -111,6 +111,39 @@ func TestThinkingPresenceIsPrimaryQualitySignal(t *testing.T) {
 	}
 }
 
+func TestBareToolCallSkipsOutputFloor(t *testing.T) {
+	pol := defaultPolicy()
+	pol.ThinkingGuard = true
+	// A bare tool call of 27 tokens is full evidence when reasoning is absent.
+	if got := classifyPassiveQuality(100, 27, false, 1, pol); got != "hard" {
+		t.Fatalf("tool call without thinking=%q, want hard", got)
+	}
+	// Plain prose below the floor stays ignored.
+	if got := classifyPassiveQuality(100, 27, false, 0, pol); got != "ignored" {
+		t.Fatalf("short prose without thinking=%q, want ignored", got)
+	}
+	// A tool call that did carry reasoning is not downgraded.
+	if got := classifyPassiveQuality(10, 200, true, 1, pol); got != "healthy" {
+		t.Fatalf("tool call with thinking=%q, want healthy", got)
+	}
+}
+
+func TestToolCallsFromRecord(t *testing.T) {
+	if got := toolCallsFromRecord(map[string]any{
+		"Detail": map[string]any{"ToolCallsRequested": float64(1)},
+	}); got != 1 {
+		t.Fatalf("detail tool calls=%d", got)
+	}
+	if got := toolCallsFromRecord(map[string]any{
+		"tool_usage_details": map[string]any{"tool_calls_requested": float64(2)},
+	}); got != 2 {
+		t.Fatalf("nested tool calls=%d", got)
+	}
+	if got := toolCallsFromRecord(map[string]any{}); got != 0 {
+		t.Fatalf("absent tool calls=%d", got)
+	}
+}
+
 func TestThinkingGuardOffFallsBackToTPSOnly(t *testing.T) {
 	pol := defaultPolicy()
 	pol.ThinkingGuard = false
