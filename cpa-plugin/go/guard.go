@@ -316,6 +316,115 @@ func classifyFailureKind(status int, body string) string {
 	return "request_error"
 }
 
+// Billing and free-usage exhaustion are account states, not egress quality.
+// The reason text is the recovery contract: the sweep re-enables the account
+// after the matching cooldown, and an operator can enable it earlier.
+const (
+	billingExhaustedReason     = "额度耗尽（spending-limit），充值后手动恢复；24 小时后自动重试"
+	billingExhaustedCooldown   = 24 * time.Hour
+	freeUsageExhaustedReason   = "免费额度用尽，30 分钟后自动恢复"
+	freeUsageExhaustedCooldown = 30 * time.Minute
+)
+
+// isBillingExhausted reports a paid-quota or subscription block. Waiting does
+// not clear it, so the credential must leave rotation instead of being retried.
+func isBillingExhausted(status int, body string) bool {
+	lower := strings.ToLower(body)
+	for _, marker := range []string{
+		"spending-limit",
+		"spending_limit",
+		"personal-team-blocked",
+		"out of credits",
+		"add credits",
+		"need a grok subscription",
+		"supergrok",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// isFreeUsageExhausted reports the plan's included free usage running out.
+// It clears on the plan's own cycle, so a short cooldown is enough.
+func isFreeUsageExhausted(status int, body string) bool {
+	lower := strings.ToLower(body)
+	for _, marker := range []string{
+		"free-usage-exhausted",
+		"free_usage_exhausted",
+		"subscription:free-usage",
+		"included free usage",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// disableAccountsForBilling takes the bound credentials out of rotation and
+// leaves the node alone: a new exit IP would not restore the account balance.
+func disableAccountsForBilling(store *stateStore, nodeID, reason, event string) {
+	if store == nil || strings.TrimSpace(nodeID) == "" {
+		return
+	}
+	node, ok := store.getNode(nodeID)
+	if !ok || node == nil {
+		return
+	}
+	if err := disableAuthsOnNode(store, node, reason); err != nil {
+		log.Printf("quota disable failed node=%s err=%v", node.ID, err)
+		return
+	}
+	store.appendEvent(guardEvent{Event: event, NodeID: node.ID, NodeName: node.Name, Reason: reason})
+}
+
+// recoverQuotaAccounts re-enables credentials whose cooldown elapsed.
+var (
+	quotaRecoveryMu   sync.Mutex
+	lastQuotaRecovery time.Time
+)
+
+func recoverQuotaAccounts() {
+	quotaRecoveryMu.Lock()
+	if time.Since(lastQuotaRecovery) < 5*time.Minute {
+		quotaRecoveryMu.Unlock()
+		return
+	}
+	lastQuotaRecovery = time.Now()
+	quotaRecoveryMu.Unlock()
+
+	auths, err := listAuthFilesFresh()
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	for _, a := range auths {
+		if !a.Disabled {
+			continue
+		}
+		reason, _ := a.Raw["disabled_reason"].(string)
+		var cooldown time.Duration
+		switch {
+		case strings.HasPrefix(reason, billingExhaustedReason):
+			cooldown = billingExhaustedCooldown
+		case strings.HasPrefix(reason, freeUsageExhaustedReason):
+			cooldown = freeUsageExhaustedCooldown
+		default:
+			continue
+		}
+		at, _ := a.Raw["disabled_at"].(string)
+		ts, errParse := time.Parse(time.RFC3339, at)
+		if errParse != nil || now.Sub(ts) < cooldown {
+			continue
+		}
+		if errEnable := setAuthProxyAndFlags(a, a.ProxyURL, false, ""); errEnable != nil {
+			log.Printf("quota recovery failed auth=%s err=%v", a.Name, errEnable)
+		}
+	}
+}
+
 func maxInt64(values ...int64) int64 {
 	var result int64
 	for _, value := range values {
@@ -767,6 +876,24 @@ func probeQuality(store *stateStore, node *nodeRecord, profileID string) quality
 			res.ErrorKind = kind
 			res.DurationMs = time.Since(start).Milliseconds()
 			hasNext := i+1 < len(candidates)
+			if isBillingExhausted(resp.StatusCode, bodyText) || isFreeUsageExhausted(resp.StatusCode, bodyText) {
+				reason, event := billingExhaustedReason, "account_billing_disabled"
+				if isFreeUsageExhausted(resp.StatusCode, bodyText) {
+					reason, event = freeUsageExhaustedReason, "account_free_usage_disabled"
+				}
+				if errDisable := setAuthProxyAndFlags(auth, auth.ProxyURL, true, reason); errDisable != nil {
+					log.Printf("quality quota disable failed auth=%s err=%v", authProbeLabel(auth), errDisable)
+				} else {
+					store.appendEvent(guardEvent{Event: event, NodeID: node.ID, NodeName: node.Name, AuthID: auth.Name, Reason: reason})
+				}
+				if hasNext {
+					continue
+				}
+				// The credential is the problem; leave the egress classification alone.
+				res.Classification = "ignored"
+				res.Error = reason
+				return res
+			}
 			if shouldRetryProbeWithNextAuth(hasNext, resp.StatusCode, bodyText, kind) {
 				// Account/quota errors belong to the credential, not the egress.
 				// Try another account on the same channel before classifying it.
@@ -1561,6 +1688,16 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 		}
 		status := int(firstInt(failure, "StatusCode", "status_code", "status"))
 		body := firstString(failure, "Body", "body", "message", "error")
+		if isBillingExhausted(status, body) || isFreeUsageExhausted(status, body) {
+			reason, event := billingExhaustedReason, "account_billing_disabled"
+			if isFreeUsageExhausted(status, body) {
+				reason, event = freeUsageExhaustedReason, "account_free_usage_disabled"
+			}
+			nodeID := resolveNodeIDForAuth(store, authID, authIndex,
+				filepath.Base(authID), strings.TrimSuffix(filepath.Base(authID), ".json"))
+			disableAccountsForBilling(store, nodeID, reason, event)
+			return
+		}
 		errorKind = classifyFailureKind(status, body)
 		if errorKind == "transport_error" {
 			class = "error"
@@ -1693,6 +1830,7 @@ func startGuardWorker(ctx context.Context, store *stateStore) {
 				if !acceptsBackgroundWork() {
 					continue
 				}
+				recoverQuotaAccounts()
 				tick++
 				pol := store.policy()
 				now := float64(time.Now().Unix())

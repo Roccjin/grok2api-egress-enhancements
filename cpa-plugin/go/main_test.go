@@ -111,6 +111,26 @@ func TestThinkingPresenceIsPrimaryQualitySignal(t *testing.T) {
 	}
 }
 
+func TestQuotaErrorClassification(t *testing.T) {
+	billing := `{"code":"personal-team-blocked:spending-limit","error":"You have run out of credits or need a Grok subscription. Add credits at https://grok.com/?_s=usage or upgrade at https://grok.com/supergrok."}`
+	if !isBillingExhausted(402, billing) {
+		t.Fatal("spending-limit must classify as billing exhaustion")
+	}
+	if isFreeUsageExhausted(402, billing) {
+		t.Fatal("spending-limit is not the free-usage bucket")
+	}
+	free := `{"code":"subscription:free-usage-exhausted","error":"You've used all the included free usage for model grok-4.7"}`
+	if !isFreeUsageExhausted(429, free) {
+		t.Fatal("free-usage-exhausted must classify as a short cooldown")
+	}
+	if isBillingExhausted(429, free) {
+		t.Fatal("free-usage-exhausted is not a billing block")
+	}
+	if !strings.HasPrefix(billingExhaustedReason, "额度耗尽") || !strings.HasPrefix(freeUsageExhaustedReason, "免费额度用尽") {
+		t.Fatal("reason prefixes drive quota recovery")
+	}
+}
+
 func TestBareToolCallSkipsOutputFloor(t *testing.T) {
 	pol := defaultPolicy()
 	pol.ThinkingGuard = true
