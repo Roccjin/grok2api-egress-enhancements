@@ -570,6 +570,12 @@ func scanXAIProbeStream(r io.Reader) (xaiProbeStream, error) {
 		}
 	}
 	out.VisibleText = text.String()
+	// xAI does not always stream reasoning summaries on /responses. When the
+	// summary is absent the stream still reports how many reasoning tokens the
+	// turn spent, and that count is the same evidence: the credential thought.
+	if out.UsageReason > 0 {
+		out.HasThinking = true
+	}
 	return out, scanner.Err()
 }
 

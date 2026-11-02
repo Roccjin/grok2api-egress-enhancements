@@ -555,6 +555,26 @@ func TestScanXAIProbeStreamWithoutReasoning(t *testing.T) {
 	}
 }
 
+func TestScanXAIProbeStreamUsageReasoningCounts(t *testing.T) {
+	// Production pool: no reasoning events, but the usage block reports the
+	// reasoning tokens the turn spent. That must classify as thinking.
+	stream := strings.Join([]string{
+		`data: {"type":"response.output_text.delta","delta":"TCP slow start is"}`,
+		`data: {"type":"response.completed","response":{"output":[{"type":"message"}],"usage":{"output_tokens":384,"output_tokens_details":{"reasoning_tokens":1044}}}}`,
+		`data: [DONE]`,
+	}, "\n")
+	got, err := scanXAIProbeStream(strings.NewReader(stream))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.HasThinking {
+		t.Fatal("usage reasoning tokens must count as thinking when no summary is streamed")
+	}
+	if got.UsageReason != 1044 {
+		t.Fatalf("reasoning tokens=%d", got.UsageReason)
+	}
+}
+
 func TestThinkingCrossVerifySchedulesInsteadOfQuarantine(t *testing.T) {
 	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
 	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
