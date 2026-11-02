@@ -455,6 +455,137 @@ func outputTokensFromUsage(usage map[string]any) int64 {
 	)
 }
 
+// buildXAIProbePayload is a Responses API request, matching the shape real
+// traffic sends upstream. It deliberately carries no messages/max_tokens: those
+// belong to chat/completions, where the upstream stops streaming reasoning text
+// for most credentials.
+func buildXAIProbePayload(model, prompt string, maxTokens int) map[string]any {
+	return map[string]any{
+		"model": model,
+		"input": []map[string]any{
+			{"role": "user", "content": []map[string]any{
+				{"type": "input_text", "text": prompt},
+			}},
+		},
+		"reasoning":         map[string]any{"effort": probeReasoningEffort},
+		"stream":            true,
+		"max_output_tokens": maxTokens,
+	}
+}
+
+// xaiProbeStream is what one Responses SSE stream said about the credential
+// behind it.
+type xaiProbeStream struct {
+	FirstTokenAt time.Time
+	ContentLen   int
+	UsageOut     int64
+	UsageReason  int64
+	HasThinking  bool
+	VisibleText  string
+	LastError    string
+}
+
+// scanXAIProbeStream reads an xAI Responses SSE stream. Reasoning counts as
+// visible when the stream carries reasoning events or a reasoning output item;
+// the chat/completions reasoning_content field is not consulted, because that
+// endpoint omits it for most credentials and made healthy accounts look degraded.
+func scanXAIProbeStream(r io.Reader) (xaiProbeStream, error) {
+	var out xaiProbeStream
+	var text strings.Builder
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" || data == "[DONE]" {
+			if data == "[DONE]" {
+				break
+			}
+			continue
+		}
+		var event map[string]any
+		if json.Unmarshal([]byte(data), &event) != nil {
+			continue
+		}
+		eventType, _ := event["type"].(string)
+		switch {
+		case eventType == "response.output_text.delta":
+			chunk, _ := event["delta"].(string)
+			if chunk == "" {
+				continue
+			}
+			if out.FirstTokenAt.IsZero() {
+				out.FirstTokenAt = time.Now()
+			}
+			out.ContentLen += len([]rune(chunk))
+			appendCappedRunes(&text, chunk, maxProbeContentRunes)
+		case strings.HasPrefix(eventType, "response.reasoning"):
+			// Reasoning summary streamed as events: the credential is thinking
+			// on the same path production traffic uses.
+			if out.FirstTokenAt.IsZero() {
+				out.FirstTokenAt = time.Now()
+			}
+			out.HasThinking = true
+		case eventType == "response.output_item.added" || eventType == "response.output_item.done":
+			item, _ := event["item"].(map[string]any)
+			if item == nil {
+				continue
+			}
+			if kind, _ := item["type"].(string); kind == "reasoning" {
+				out.HasThinking = true
+				if out.FirstTokenAt.IsZero() {
+					out.FirstTokenAt = time.Now()
+				}
+			}
+		case eventType == "response.completed" || eventType == "response.incomplete":
+			response, _ := event["response"].(map[string]any)
+			if usage, ok := response["usage"].(map[string]any); ok {
+				out.UsageOut = maxInt64(out.UsageOut, outputTokensFromUsage(usage))
+				out.UsageReason = maxInt64(out.UsageReason, reasoningTokensFromUsage(usage))
+			}
+			if items, ok := response["output"].([]any); ok {
+				for _, raw := range items {
+					item, ok := raw.(map[string]any)
+					if !ok {
+						continue
+					}
+					if kind, _ := item["type"].(string); kind == "reasoning" {
+						out.HasThinking = true
+					}
+				}
+			}
+		case eventType == "response.failed" || eventType == "error":
+			if response, ok := event["response"].(map[string]any); ok {
+				if errObj, ok := response["error"].(map[string]any); ok {
+					if msg, ok := errObj["message"].(string); ok && msg != "" {
+						out.LastError = truncate(msg, 160)
+					}
+				}
+			} else if msg, ok := event["message"].(string); ok && msg != "" {
+				out.LastError = truncate(msg, 160)
+			}
+		}
+	}
+	out.VisibleText = text.String()
+	return out, scanner.Err()
+}
+
+// reasoningTokensFromUsage reads the reasoning bucket from a Responses usage
+// block, where it sits under output_tokens_details.
+func reasoningTokensFromUsage(usage map[string]any) int64 {
+	if usage == nil {
+		return 0
+	}
+	var nested int64
+	if details, ok := usage["output_tokens_details"].(map[string]any); ok {
+		nested = maxInt64(anyInt(details["reasoning_tokens"]), anyInt(details["ReasoningTokens"]))
+	}
+	return maxInt64(nested, anyInt(usage["reasoning_tokens"]), anyInt(usage["ReasoningTokens"]))
+}
+
 func httpClientThroughProxy(proxyURL string, timeout time.Duration) (*http.Client, error) {
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
@@ -499,6 +630,7 @@ type qualityResult struct {
 	Classification  string  `json:"classification"`
 	TPS             float64 `json:"tps"`
 	OutputTokens    int64   `json:"output_tokens"`
+	ReasoningTokens int64   `json:"reasoning_tokens,omitempty"`
 	DurationMs      int64   `json:"duration_ms"`
 	FirstTokenMs    int64   `json:"first_token_ms"`
 	HasThinking     bool    `json:"has_thinking,omitempty"`
@@ -591,6 +723,17 @@ func rotateNodeIfConfigured(store *stateStore, node *nodeRecord) (bool, error) {
 // 1.0.13 as of 2026-10-01. Keep this aligned with CLIProxyAPI
 // xaiClientVersionValue (real traffic already sends that pin).
 const grokCLIClientVersion = "1.0.44"
+
+const (
+	// xaiProbePath follows the production traffic path. xAI's chat/completions
+	// endpoint hides reasoning text for most credentials, so a probe that
+	// requires it there reports healthy accounts as degraded.
+	xaiProbePath = "/responses"
+	// probeReasoningEffort is the effort the probe asks for. The probe's job is
+	// to confirm that the credential still produces visible reasoning on the
+	// path real requests use.
+	probeReasoningEffort = "high"
+)
 
 func applyGrokClientHeaders(req *http.Request, auth authFile) {
 	// Always force Grok CLI headers — missing X-XAI-Token-Auth yields
@@ -808,20 +951,7 @@ func probeQuality(store *stateStore, node *nodeRecord, profileID string) quality
 	if maxTok <= 0 {
 		maxTok = 256
 	}
-	temp := profile.Temperature
-	if temp == 0 && profile.ID == profileThroughput {
-		temp = 0.7
-	}
-	payload := map[string]any{
-		"model": model,
-		"messages": []map[string]string{
-			{"role": "user", "content": profile.Prompt},
-		},
-		"stream":      true,
-		"max_tokens":  maxTok,
-		"temperature": temp,
-	}
-	body, _ := json.Marshal(payload)
+	body, _ := json.Marshal(buildXAIProbePayload(model, profile.Prompt, maxTok))
 
 	var lastErr string
 	for i, auth := range candidates {
@@ -840,7 +970,7 @@ func probeQuality(store *stateStore, node *nodeRecord, profileID string) quality
 		}
 		baseURL = strings.TrimRight(baseURL, "/")
 
-		req, errReq := http.NewRequest(http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(body))
+		req, errReq := http.NewRequest(http.MethodPost, baseURL+xaiProbePath, bytes.NewReader(body))
 		if errReq != nil {
 			res.Classification = "error"
 			res.ErrorKind = "request_error"
@@ -908,104 +1038,47 @@ func probeQuality(store *stateStore, node *nodeRecord, profileID string) quality
 			return res
 		}
 
-		var (
-			firstTokenAt time.Time
-			contentLen   int
-			usageOut     int64
-			usageReason  int64
-			hasThinking  bool
-			visibleText  strings.Builder
-		)
-		scanner := bufio.NewScanner(resp.Body)
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if !strings.HasPrefix(line, "data:") {
-				continue
-			}
-			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			if data == "" || data == "[DONE]" {
-				if data == "[DONE]" {
-					break
-				}
-				continue
-			}
-			var chunk map[string]any
-			if json.Unmarshal([]byte(data), &chunk) != nil {
-				continue
-			}
-			if u, ok := chunk["usage"].(map[string]any); ok {
-				usageOut = maxInt64(usageOut, outputTokensFromUsage(u))
-				usageReason = maxInt64(usageReason, anyInt(u["reasoning_tokens"]), anyInt(u["reasoningTokens"]))
-			}
-			choices, _ := chunk["choices"].([]any)
-			for _, c := range choices {
-				cm, _ := c.(map[string]any)
-				delta, _ := cm["delta"].(map[string]any)
-				if delta == nil {
-					if msg, ok := cm["message"].(map[string]any); ok {
-						delta = msg
-					}
-				}
-				if delta == nil {
-					continue
-				}
-				if mapHasThinkingContent(delta) {
-					hasThinking = true
-				}
-				if t, ok := delta["content"].(string); ok && t != "" {
-					if firstTokenAt.IsZero() {
-						firstTokenAt = time.Now()
-					}
-					contentLen += len([]rune(t))
-					appendCappedRunes(&visibleText, t, maxProbeContentRunes)
-				}
-				for _, key := range []string{"thinking_content", "reasoning_content", "thinking"} {
-					if t, ok := delta[key].(string); ok && t != "" {
-						if firstTokenAt.IsZero() {
-							firstTokenAt = time.Now()
-						}
-						contentLen += len([]rune(t))
-					}
-				}
-			}
-		}
+		stream, scanErrStream := scanXAIProbeStream(resp.Body)
 		_ = resp.Body.Close()
-		if scanErr := scanner.Err(); scanErr != nil {
+		if scanErrStream != nil {
 			dur := time.Since(start).Milliseconds()
 			// Broken stream while reading SSE: hard-quarantine, do not switch auth.
-			if isProbeTimeoutErr(scanErr) || isProbeUnstableErr(scanErr) {
-				return probeUnstableResult(res, scanErr, dur)
+			if isProbeTimeoutErr(scanErrStream) || isProbeUnstableErr(scanErrStream) {
+				return probeUnstableResult(res, scanErrStream, dur)
 			}
-			lastErr = "模型探测流读取失败: " + truncate(scanErr.Error(), 120)
+			lastErr = "模型探测流读取失败: " + truncate(scanErrStream.Error(), 120)
 			res.ErrorKind = "transport_error"
 			res.DurationMs = dur
 			continue
 		}
+		if stream.LastError != "" {
+			lastErr = stream.LastError
+		}
 
 		duration := time.Since(start)
 		res.DurationMs = duration.Milliseconds()
-		if !firstTokenAt.IsZero() {
-			res.FirstTokenMs = firstTokenAt.Sub(start).Milliseconds()
+		if !stream.FirstTokenAt.IsZero() {
+			res.FirstTokenMs = stream.FirstTokenAt.Sub(start).Milliseconds()
 		}
 		// CPA's xAI usage contract treats reasoning tokens as a subset of output
 		// tokens. Prefer the authoritative total instead of adding the buckets.
-		outTokens := usageOut
-		if usageReason > outTokens {
-			outTokens = usageReason
+		outTokens := stream.UsageOut
+		if stream.UsageReason > outTokens {
+			outTokens = stream.UsageReason
 		}
 		if outTokens <= 0 {
-			outTokens = int64(contentLen / 4)
-			if outTokens == 0 && contentLen > 0 {
+			outTokens = int64(stream.ContentLen / 4)
+			if outTokens == 0 && stream.ContentLen > 0 {
 				outTokens = 1
 			}
 		}
 		res.OutputTokens = outTokens
-		res.HasThinking = hasThinking
+		res.ReasoningTokens = stream.UsageReason
+		res.HasThinking = stream.HasThinking
 		res.AuthID = firstNonEmpty(auth.ID, auth.Index, auth.Name, auth.Email)
 		res.AuthLabel = authProbeLabel(auth)
 		res.TPS = computeTPS(outTokens, res.DurationMs, res.FirstTokenMs, pol.MinGenerationMs)
-		res.ExpectedMatched = matchExpected(visibleText.String(), profile.ExpectedText, profile.MatchMode)
+		res.ExpectedMatched = matchExpected(stream.VisibleText, profile.ExpectedText, profile.MatchMode)
 		res = classifyWithProfile(res, profile, pol)
 		if res.Classification == "unknown" && outTokens == 0 {
 			lastErr = "探测无输出"

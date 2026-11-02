@@ -226,7 +226,7 @@ func defaultPolicy() policyConfig {
 		MinHealthyNodes:            1,
 		MinGenerationMs:            1000,
 		MinOutputTokens:            32,
-		Model:                      "grok-4.5",
+		Model:                      "grok-4.7",
 		DisableAuthOnHard:          true,
 		ThinkingGuard:              true,
 		ThinkingRetry:              3,

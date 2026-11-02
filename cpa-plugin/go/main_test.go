@@ -447,6 +447,114 @@ func TestMissingThinkingRequiresConsecutiveStrikes(t *testing.T) {
 	}
 }
 
+// waitCrossVerifyIdle blocks until every scheduled cross-verify probe has
+// returned. A scheduled probe marks the store dirty, and the 2s debounce would
+// otherwise write state.json while the test's temp dir is being removed.
+func waitCrossVerifyIdle(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		crossVerifyMu.Lock()
+		pending := len(crossVerifyInflight)
+		crossVerifyMu.Unlock()
+		if pending == 0 {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("cross-verify probe did not finish")
+}
+
+func TestProbePayloadUsesResponsesShape(t *testing.T) {
+	if xaiProbePath != "/responses" {
+		t.Fatalf("probe path=%q, want /responses", xaiProbePath)
+	}
+	payload := buildXAIProbePayload("grok-4.7", "hello", 384)
+	if _, ok := payload["messages"]; ok {
+		t.Fatal("probe must not send chat/completions messages")
+	}
+	if _, ok := payload["max_tokens"]; ok {
+		t.Fatal("probe must not send max_tokens")
+	}
+	if got := payload["max_output_tokens"]; got != 384 {
+		t.Fatalf("max_output_tokens=%v", got)
+	}
+	reasoning, ok := payload["reasoning"].(map[string]any)
+	if !ok {
+		t.Fatal("probe must ask for a reasoning effort")
+	}
+	if reasoning["effort"] != probeReasoningEffort {
+		t.Fatalf("effort=%v", reasoning["effort"])
+	}
+	input, ok := payload["input"].([]map[string]any)
+	if !ok || len(input) != 1 {
+		t.Fatalf("input=%v", payload["input"])
+	}
+}
+
+func TestScanXAIProbeStreamSeesReasoningEvents(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"type":"response.created"}`,
+		`data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}`,
+		`data: {"type":"response.output_text.delta","delta":"TCP slow start is"}`,
+		`data: {"type":"response.completed","response":{"output":[{"type":"reasoning"},{"type":"message"}],"usage":{"output_tokens":120,"output_tokens_details":{"reasoning_tokens":80}}}}`,
+		`data: [DONE]`,
+	}, "\n")
+	got, err := scanXAIProbeStream(strings.NewReader(stream))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.HasThinking {
+		t.Fatal("reasoning events must count as visible reasoning")
+	}
+	if got.VisibleText != "TCP slow start is" {
+		t.Fatalf("visible text=%q", got.VisibleText)
+	}
+	if got.UsageOut != 120 || got.UsageReason != 80 {
+		t.Fatalf("usage out=%d reason=%d", got.UsageOut, got.UsageReason)
+	}
+	if got.FirstTokenAt.IsZero() {
+		t.Fatal("first token time not recorded")
+	}
+}
+
+func TestScanXAIProbeStreamReasoningItemOnly(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"type":"response.output_item.added","item":{"type":"reasoning","id":"rs_1"}}`,
+		`data: {"type":"response.output_text.delta","delta":"TCP slow start"}`,
+		`data: {"type":"response.completed","response":{"output":[{"type":"reasoning"}],"usage":{"output_tokens":64}}}`,
+		`data: [DONE]`,
+	}, "\n")
+	got, err := scanXAIProbeStream(strings.NewReader(stream))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.HasThinking {
+		t.Fatal("a reasoning output item must count as visible reasoning")
+	}
+	if got.UsageReason != 0 || got.UsageOut != 64 {
+		t.Fatalf("usage out=%d reason=%d", got.UsageOut, got.UsageReason)
+	}
+}
+
+func TestScanXAIProbeStreamWithoutReasoning(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"type":"response.output_text.delta","delta":"TCP slow start is a congestion control algorithm"}`,
+		`data: {"type":"response.completed","response":{"output":[{"type":"message"}],"usage":{"output_tokens":200}}}`,
+		`data: [DONE]`,
+	}, "\n")
+	got, err := scanXAIProbeStream(strings.NewReader(stream))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.HasThinking {
+		t.Fatal("no reasoning event must leave HasThinking false")
+	}
+	if got.UsageReason != 0 {
+		t.Fatalf("reasoning tokens=%d", got.UsageReason)
+	}
+}
+
 func TestThinkingCrossVerifySchedulesInsteadOfQuarantine(t *testing.T) {
 	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
 	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
@@ -480,7 +588,10 @@ func TestThinkingCrossVerifySchedulesInsteadOfQuarantine(t *testing.T) {
 	if !got.DisabledByGuard {
 		t.Fatal("active missing-thinking confirmation should quarantine")
 	}
-	endCrossVerify(node.ID)
+	waitCrossVerifyIdle(t)
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestObserveModeSkipsQuarantine(t *testing.T) {
@@ -641,7 +752,10 @@ func TestSoftCrossVerifySchedulesInsteadOfQuarantine(t *testing.T) {
 	if !got.DisabledByGuard {
 		t.Fatal("active soft confirmation should quarantine")
 	}
-	endCrossVerify(node.ID)
+	waitCrossVerifyIdle(t)
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestAuthDegradeCountsPassiveEvenWhenCrossVerifyScheduled(t *testing.T) {
@@ -719,7 +833,10 @@ func TestAuthDegradeCountsPassiveEvenWhenCrossVerifyScheduled(t *testing.T) {
 	if p := byID["probe@x"]; p == nil || p.DegradedCount != 1 || p.SampleCount != 2 {
 		t.Fatalf("probe missing-thinking want degrade=1 sample=2, got %+v", p)
 	}
-	endCrossVerify(node.ID)
+	waitCrossVerifyIdle(t)
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestRecordAuthDegradeStats(t *testing.T) {
