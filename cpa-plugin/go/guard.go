@@ -251,9 +251,11 @@ func classifyQuality(tps float64, outputTokens int64, hasThinking bool, pol poli
 
 // classifyPassiveQuality applies the output floor only to plain prose. A reply
 // that carries a tool call is short by construction, so a missing reasoning
-// signal is full evidence of degradation rather than a thin sample.
+// signal is full evidence of degradation rather than a thin sample. A gate
+// rejection of a bare call publishes zero output plus the call marker, which
+// must still strike the node.
 func classifyPassiveQuality(tps float64, outputTokens int64, hasThinking bool, toolCalls int64, pol policyConfig) string {
-	if pol.ThinkingGuard && !hasThinking && toolCalls > 0 && outputTokens > 0 {
+	if pol.ThinkingGuard && !hasThinking && toolCalls > 0 {
 		return "hard"
 	}
 	return classifyQuality(tps, outputTokens, hasThinking, pol)

@@ -118,6 +118,10 @@ func TestBareToolCallSkipsOutputFloor(t *testing.T) {
 	if got := classifyPassiveQuality(100, 27, false, 1, pol); got != "hard" {
 		t.Fatalf("tool call without thinking=%q, want hard", got)
 	}
+	// A gate-rejected bare call has no client output but still carries the marker.
+	if got := classifyPassiveQuality(0, 0, false, 1, pol); got != "hard" {
+		t.Fatalf("rejected tool call=%q, want hard", got)
+	}
 	// Plain prose below the floor stays ignored.
 	if got := classifyPassiveQuality(100, 27, false, 0, pol); got != "ignored" {
 		t.Fatalf("short prose without thinking=%q, want ignored", got)
