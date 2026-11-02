@@ -1083,7 +1083,15 @@ func probeQuality(store *stateStore, node *nodeRecord, profileID string) quality
 		res.HasThinking = stream.HasThinking
 		res.AuthID = firstNonEmpty(auth.ID, auth.Index, auth.Name, auth.Email)
 		res.AuthLabel = authProbeLabel(auth)
-		res.TPS = computeTPS(outTokens, res.DurationMs, res.FirstTokenMs, pol.MinGenerationMs)
+		// Throughput measures visible generation. Reasoning tokens sit inside
+		// output_tokens but are spent before the first visible token, so counting
+		// them here divides thinking time into a rate and makes a healthy account
+		// look degraded on the soft/hard TPS thresholds.
+		genTokens := outTokens - stream.UsageReason
+		if genTokens <= 0 {
+			genTokens = 1
+		}
+		res.TPS = computeTPS(genTokens, res.DurationMs, res.FirstTokenMs, pol.MinGenerationMs)
 		res.ExpectedMatched = matchExpected(stream.VisibleText, profile.ExpectedText, profile.MatchMode)
 		res = classifyWithProfile(res, profile, pol)
 		if res.Classification == "unknown" && outTokens == 0 {

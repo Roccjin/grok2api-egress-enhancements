@@ -575,6 +575,23 @@ func TestScanXAIProbeStreamUsageReasoningCounts(t *testing.T) {
 	}
 }
 
+func TestProbeThroughputExcludesReasoningTokens(t *testing.T) {
+	// 2269 output tokens over a 3s visible window is 756 TPS when the reasoning
+	// bucket is included, which trips the 500 soft threshold. Only the 384
+	// visible tokens are generation speed.
+	pol := defaultPolicy()
+	pol.MinGenerationMs = 1000
+	visible := int64(2269 - 1885)
+	tpsVisible := computeTPS(visible, 36000, 33000, pol.MinGenerationMs)
+	if got := classifyTPS(tpsVisible, pol.SoftTPS, pol.HardTPS); got != "healthy" {
+		t.Fatalf("visible-only tps=%.0f classified %s", tpsVisible, got)
+	}
+	inflated := computeTPS(2269, 36000, 33000, pol.MinGenerationMs)
+	if got := classifyTPS(inflated, pol.SoftTPS, pol.HardTPS); got == "healthy" {
+		t.Fatalf("reasoning-inclusive tps=%.0f should trip a threshold", inflated)
+	}
+}
+
 func TestThinkingCrossVerifySchedulesInsteadOfQuarantine(t *testing.T) {
 	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
 	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
